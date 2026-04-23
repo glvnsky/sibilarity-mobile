@@ -999,8 +999,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         selectedIndex: _tabIndex,
         onDestinationSelected: (index) => setState(() => _tabIndex = index),
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.album), label: 'Track'),
-          NavigationDestination(icon: Icon(Icons.equalizer), label: 'Controls'),
+          NavigationDestination(icon: Icon(Icons.link), label: 'Connect'),
+          NavigationDestination(icon: Icon(Icons.equalizer), label: 'Player'),
           NavigationDestination(icon: Icon(Icons.library_music), label: 'Library'),
         ],
       ),
@@ -1011,11 +1011,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               child: ListView(
                 padding: const EdgeInsets.all(16),
                 children: [
-                  _connectionCard(context),
-                  const SizedBox(height: 12),
                   if (_tabIndex == 0) ...[
-                    _trackMetadataCard(context),
+                    _connectionCard(context),
                   ] else if (_tabIndex == 1) ...[
+                    _trackMetadataCard(context),
+                    const SizedBox(height: 12),
                     _nowPlayingCard(context),
                     const SizedBox(height: 12),
                     _transportCard(context),
