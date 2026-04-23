@@ -141,6 +141,16 @@ class MusicApi {
     return accessToken;
   }
 
+  Future<void> logout() async {
+    final response = await http.post(
+      _buildUri('/api/auth/logout'),
+      headers: _headers,
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Logout failed: ${response.statusCode} ${response.body}');
+    }
+  }
+
   Future<List<TrackItem>> library({bool forceRescan = false}) async {
     // Keep compatibility with both old and new backend endpoints.
     final body = await _getJson(forceRescan ? '/api/library/files' : '/api/files');

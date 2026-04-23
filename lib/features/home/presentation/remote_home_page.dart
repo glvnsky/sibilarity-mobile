@@ -197,14 +197,14 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       unawaited(_refreshCurrentMetadata());
       await _saveConfig();
     } catch (e) {
-      if (_refreshToken.isNotEmpty && e.toString().contains('401')) {
-        try {
-          final newToken = await _api.refreshAccessToken(_refreshToken);
-          _tokenController.text = newToken;
-          await _saveConfig();
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
           await _connectAndSync(showGlobalBusy: showGlobalBusy);
           return;
-        } catch (_) {}
+        }
+        await _markSessionExpired();
+        return;
       }
       setState(() {
         _serverHealthy = false;
@@ -223,6 +223,114 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   }
 
   Future<void> _connectFromUi() => _connectAndSync();
+
+  bool _isUnauthorizedError(Object error) {
+    final message = error.toString().toLowerCase();
+    return message.contains('401') || message.contains('unauthorized');
+  }
+
+  Future<bool> _tryRefreshSession() async {
+    if (_refreshToken.isEmpty) {
+      return false;
+    }
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl.isEmpty) {
+      return false;
+    }
+    try {
+      _api.configure(baseUrl: baseUrl, token: _normalizedToken(_tokenController.text));
+      final newToken = await _api.refreshAccessToken(_refreshToken);
+      _tokenController.text = newToken;
+      _api.configure(baseUrl: baseUrl, token: newToken);
+      await _saveConfig();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _markSessionExpired({String message = 'Session expired. Pair again.'}) async {
+    _tokenController.clear();
+    _refreshToken = '';
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('api_token');
+    await prefs.remove('refresh_token');
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _serverHealthy = false;
+      _statusText = 'Not paired';
+      _lastError = message;
+      _commandStatus = 'Not paired';
+      _commandBusy = false;
+    });
+  }
+
+  Future<void> _disconnect() async {
+    final baseUrl = _baseUrlController.text.trim();
+    final token = _normalizedToken(_tokenController.text);
+    if (baseUrl.isNotEmpty && token.isNotEmpty) {
+      try {
+        _api.configure(baseUrl: baseUrl, token: token);
+        await _api.logout();
+      } catch (e) {
+        if (!_isUnauthorizedError(e) && mounted) {
+          setState(() {
+            _lastError = 'Disconnect warning: $e';
+          });
+        }
+        // Local disconnect must still proceed even if server logout fails.
+      }
+    }
+
+    await _wsSubscription?.cancel();
+    _wsSubscription = null;
+    await _channel?.sink.close();
+    _channel = null;
+    _positionTimer?.cancel();
+    _positionTimer = null;
+
+    _tokenController.clear();
+    _baseUrlController.clear();
+    _refreshToken = '';
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('base_url');
+    await prefs.remove('api_token');
+    await prefs.remove('refresh_token');
+
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _backgroundSyncing = false;
+      _commandBusy = false;
+      _discovering = false;
+      _pairing = false;
+      _serverHealthy = false;
+      _statusText = 'Disconnected';
+      _commandStatus = 'Session revoked';
+      _lastError = '';
+      _tabIndex = 0;
+      _currentTrack = 'No active track';
+      _currentTrackId = null;
+      _selectedTrackId = null;
+      _volume = 50;
+      _position = 0;
+      _duration = 0;
+      _isSeeking = false;
+      _shuffle = false;
+      _repeatMode = 'off';
+      _uploading = false;
+      _uploadProgress = 0;
+      _metadataLoading = false;
+      _currentMetadata = null;
+      _metadataCache.clear();
+      _library = const [];
+      _discoveredServers.clear();
+    });
+  }
 
   void _connectWebSocket() {
     _wsSubscription?.cancel();
@@ -278,7 +386,14 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       setState(() {
         _discoveredServers
           ..clear()
-          ..addAll(discovered.toList()..sort((a, b) => a.name.compareTo(b.name)));
+          ..addAll(discovered);
+
+        if (discovered.isNotEmpty) {
+          // Discovery service returns best candidates first.
+          _baseUrlController.text = discovered.first.baseUrl;
+        } else {
+          _lastError = 'No servers found in local network.';
+        }
       });
     } catch (e) {
       if (mounted) {
@@ -520,6 +635,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       final state = await _api.state();
       _applyState(state);
     } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _refreshState();
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
       setState(() {
         _lastError = e.toString();
       });
@@ -560,6 +684,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _duration = nextDuration;
       });
     } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _refreshPosition(silent: silent);
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
       if (!silent && mounted) {
         setState(() {
           _lastError = e.toString();
@@ -579,6 +712,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       });
       unawaited(_refreshCurrentMetadata());
     } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _refreshLibrary();
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
       setState(() {
         _lastError = e.toString();
       });
@@ -628,7 +770,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         }
         _metadataLoading = false;
       });
-    } catch (_) {
+    } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _refreshCurrentMetadata();
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
       if (!mounted) {
         return;
       }
@@ -651,6 +802,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _commandStatus = 'Done';
       });
     } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _sendCommand(endpoint, body: body);
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
       setState(() {
         _lastError = e.toString();
         _commandStatus = 'Failed';
@@ -684,6 +844,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _commandStatus = 'Done';
       });
     } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _seekTo(value);
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
       setState(() {
         _lastError = e.toString();
         _commandStatus = 'Failed';
@@ -759,6 +928,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       );
       await _refreshLibrary();
     } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        await _markSessionExpired();
+        return;
+      }
       setState(() {
         _lastError = e.toString();
       });
@@ -821,13 +994,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   Widget build(BuildContext context) => Scaffold(
       appBar: AppBar(
         title: const Text('Sibilarity Music Remote'),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: _busy ? null : _connectAndSync,
-            icon: const Icon(Icons.sync),
-          ),
-        ],
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tabIndex,
@@ -911,10 +1077,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               spacing: 8,
               runSpacing: 8,
               children: [
-                FilledButton.icon(
-                  onPressed: _busy ? null : _connectFromUi,
-                  icon: const Icon(Icons.link),
-                  label: const Text('Connect'),
+                OutlinedButton.icon(
+                  onPressed: (_busy || _backgroundSyncing) ? null : _disconnect,
+                  icon: const Icon(Icons.link_off),
+                  label: const Text('Disconnect'),
                 ),
                 FilledButton.tonalIcon(
                   onPressed: _pairing ? null : _pairAndConnect,
