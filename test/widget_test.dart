@@ -7,7 +7,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:music_remote_app/main.dart';
+import 'package:music_remote_app/app/music_remote_app.dart';
 
 void main() {
   testWidgets('app renders main title', (WidgetTester tester) async {
