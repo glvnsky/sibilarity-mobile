@@ -28,6 +28,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   int _tabIndex = 0;
   bool _busy = false;
+  bool _initializing = true;
+  bool _backgroundSyncing = false;
   bool _commandBusy = false;
   bool _serverHealthy = false;
   double _volume = 50;
@@ -62,7 +64,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   @override
   void initState() {
     super.initState();
-    _loadConfig();
+    _bootstrap();
   }
 
   @override
@@ -73,6 +75,22 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _channel?.sink.close();
     _positionTimer?.cancel();
     super.dispose();
+  }
+
+  Future<void> _bootstrap() async {
+    await _loadConfig();
+    if (!mounted) {
+      return;
+    }
+    // Let the first frame render before any network sync to reduce startup jank.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final hasBase = _baseUrlController.text.trim().isNotEmpty;
+      final hasToken = _normalizedToken(_tokenController.text).isNotEmpty;
+      if (hasBase && hasToken) {
+        // Silent reconnect: keep UI interactive while restoring the previous session.
+        unawaited(_connectAndSync(showGlobalBusy: false));
+      }
+    });
   }
 
   Future<void> _loadConfig() async {
@@ -101,6 +119,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       setState(() {
         _serverHealthy = false;
         _statusText = 'Ready for pairing';
+        _initializing = false;
       });
     }
   }
@@ -113,9 +132,13 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     await prefs.setString('device_id', _deviceId);
   }
 
-  Future<void> _connectAndSync() async {
+  Future<void> _connectAndSync({bool showGlobalBusy = true}) async {
     setState(() {
-      _busy = true;
+      if (showGlobalBusy) {
+        _busy = true;
+      } else {
+        _backgroundSyncing = true;
+      }
       _lastError = '';
     });
 
@@ -123,7 +146,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     final token = _normalizedToken(_tokenController.text);
     if (baseUrl.isEmpty) {
       setState(() {
-        _busy = false;
+        if (showGlobalBusy) {
+          _busy = false;
+        } else {
+          _backgroundSyncing = false;
+        }
         _serverHealthy = false;
         _statusText = 'Server is not selected';
         _lastError = 'Use Discover and pick a server first.';
@@ -132,7 +159,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
     if (token.isEmpty) {
       setState(() {
-        _busy = false;
+        if (showGlobalBusy) {
+          _busy = false;
+        } else {
+          _backgroundSyncing = false;
+        }
         _serverHealthy = false;
         _statusText = 'Device is not paired';
         _lastError = 'Tap "Pair & Connect" to authorize this device.';
@@ -142,9 +173,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
     try {
       _api.configure(baseUrl: baseUrl, token: token);
-      final health = await _api.health();
-      final state = await _api.state();
-      final libraryData = await _api.library();
+      // Run independent startup requests in parallel.
+      final (health, state, libraryData) = await (
+        _api.health(),
+        _api.state(),
+        _api.library(),
+      ).wait;
 
       _applyState(state);
       setState(() {
@@ -159,7 +193,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _connectWebSocket();
       _startPositionPolling();
       await _refreshPosition();
-      await _refreshCurrentMetadata();
+      // Metadata can load after UI is already ready.
+      unawaited(_refreshCurrentMetadata());
       await _saveConfig();
     } catch (e) {
       if (_refreshToken.isNotEmpty && e.toString().contains('401')) {
@@ -167,7 +202,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           final newToken = await _api.refreshAccessToken(_refreshToken);
           _tokenController.text = newToken;
           await _saveConfig();
-          await _connectAndSync();
+          await _connectAndSync(showGlobalBusy: showGlobalBusy);
           return;
         } catch (_) {}
       }
@@ -178,10 +213,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       });
     } finally {
       setState(() {
-        _busy = false;
+        if (showGlobalBusy) {
+          _busy = false;
+        } else {
+          _backgroundSyncing = false;
+        }
       });
     }
   }
+
+  Future<void> _connectFromUi() => _connectAndSync();
 
   void _connectWebSocket() {
     _wsSubscription?.cancel();
@@ -192,6 +233,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _wsSubscription = _channel!.stream.listen(
         (message) {
           final decoded = _tryDecode(message);
+          // WebSocket payloads are expected to be state-like JSON events.
           if (decoded is Map<String, dynamic>) {
             _handleWsEvent(decoded);
           }
@@ -211,7 +253,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   void _startPositionPolling() {
     _positionTimer?.cancel();
-    _positionTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    // Slightly slower polling avoids excessive state churn on the UI thread.
+    _positionTimer = Timer.periodic(const Duration(milliseconds: 1200), (_) {
       _refreshPosition(silent: true);
     });
   }
@@ -394,6 +437,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
 
     if (eventType == 'library_changed' || eventType == 'files_changed') {
+      // Server can emit this after upload/rescan; pull a fresh list.
       _refreshLibrary();
     }
 
@@ -425,26 +469,50 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       trackTitle = trackRaw.toString();
     }
 
+    final nextVolume = (volumeRaw is num ? volumeRaw.toDouble() : _volume).clamp(0, 100).toDouble();
+    final nextShuffle = shuffleRaw is bool ? shuffleRaw : _shuffle;
+    final nextRepeatMode = _normalizeRepeatMode(repeatRaw?.toString() ?? _repeatMode);
+    final nextStatus = statusRaw?.toString() ?? _statusText;
+    final nextTrackId = currentTrackId;
+    final nextTrackTitle = nextTrackId != null && nextTrackId.isNotEmpty ? _resolveTrackTitle(nextTrackId) : trackTitle;
+    final nextDuration = durationRaw is num && durationRaw.toDouble() > 0 ? durationRaw.toDouble() : _duration;
+    final nextPosition = !_isSeeking && positionRaw is num ? positionRaw.toDouble() : _position;
+    final trackChanged = _currentTrackId != nextTrackId;
+
+    // Skip rebuild when deltas are tiny/no-op; this runs frequently.
+    final changed = (nextVolume - _volume).abs() > 0.1 ||
+        nextShuffle != _shuffle ||
+        nextRepeatMode != _repeatMode ||
+        nextStatus != _statusText ||
+        nextTrackTitle != _currentTrack ||
+        nextTrackId != _currentTrackId ||
+        (nextDuration - _duration).abs() > 0.1 ||
+        (!_isSeeking && (nextPosition - _position).abs() > 0.1);
+
+    if (!changed) {
+      return;
+    }
+
     setState(() {
-      _volume = (volumeRaw is num ? volumeRaw.toDouble() : _volume).clamp(0, 100);
-      _shuffle = shuffleRaw is bool ? shuffleRaw : _shuffle;
-      _repeatMode = _normalizeRepeatMode(repeatRaw?.toString() ?? _repeatMode);
-      _statusText = statusRaw?.toString() ?? _statusText;
-      _currentTrack = currentTrackId != null && currentTrackId.isNotEmpty ? _resolveTrackTitle(currentTrackId) : trackTitle;
-      _currentTrackId = currentTrackId;
-      if (currentTrackId != null && currentTrackId.isNotEmpty) {
-        _selectedTrackId = currentTrackId;
+      _volume = nextVolume;
+      _shuffle = nextShuffle;
+      _repeatMode = nextRepeatMode;
+      _statusText = nextStatus;
+      _currentTrack = nextTrackTitle;
+      _currentTrackId = nextTrackId;
+      if (nextTrackId != null && nextTrackId.isNotEmpty) {
+        _selectedTrackId = nextTrackId;
       }
-      if (durationRaw is num && durationRaw.toDouble() > 0) {
-        _duration = durationRaw.toDouble();
-      }
+      _duration = nextDuration;
       if (!_isSeeking) {
-        if (positionRaw is num) {
-          _position = positionRaw.toDouble();
-        }
+        _position = nextPosition;
       }
     });
-    _refreshCurrentMetadata();
+
+    if (trackChanged) {
+      // Metadata fetch is tied to track identity, not every state event.
+      unawaited(_refreshCurrentMetadata());
+    }
   }
 
   Future<void> _refreshState() async {
@@ -464,17 +532,32 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       if (!mounted) {
         return;
       }
+      final pos = position['position'];
+      final dur = position['duration'];
+      var shouldSetState = false;
+      var nextPosition = _position;
+      var nextDuration = _duration;
+
+      if (!_isSeeking && pos is num) {
+        final parsedPosition = pos.toDouble();
+        if ((parsedPosition - _position).abs() > 0.1) {
+          nextPosition = parsedPosition;
+          shouldSetState = true;
+        }
+      }
+      if (dur is num && dur.toDouble() > 0) {
+        final parsedDuration = dur.toDouble();
+        if ((parsedDuration - _duration).abs() > 0.1) {
+          nextDuration = parsedDuration;
+          shouldSetState = true;
+        }
+      }
+      if (!shouldSetState) {
+        return;
+      }
       setState(() {
-        final pos = position['position'];
-        final dur = position['duration'];
-        if (!_isSeeking) {
-          if (pos is num) {
-            _position = pos.toDouble();
-          }
-        }
-        if (dur is num && dur.toDouble() > 0) {
-          _duration = dur.toDouble();
-        }
+        _position = nextPosition;
+        _duration = nextDuration;
       });
     } catch (e) {
       if (!silent && mounted) {
@@ -515,6 +598,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
     final cached = _metadataCache[trackId];
     if (cached != null) {
+      // Cache hit avoids duplicate metadata requests on repeated state updates.
+      if (_currentMetadata?.trackId == cached.trackId && !_metadataLoading) {
+        return;
+      }
       if (mounted) {
         setState(() {
           _currentMetadata = cached;
@@ -754,7 +841,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       body: _busy
           ? const Center(child: CircularProgressIndicator())
           : RefreshIndicator(
-              onRefresh: _connectAndSync,
+            onRefresh: _connectFromUi,
               child: ListView(
                 padding: const EdgeInsets.all(16),
                 children: [
@@ -825,7 +912,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               runSpacing: 8,
               children: [
                 FilledButton.icon(
-                  onPressed: _connectAndSync,
+                  onPressed: _busy ? null : _connectFromUi,
                   icon: const Icon(Icons.link),
                   label: const Text('Connect'),
                 ),
@@ -878,6 +965,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               Text(
                 _lastError,
                 style: TextStyle(color: colors.error),
+              ),
+            ],
+            if (_initializing || _backgroundSyncing) ...[
+              const SizedBox(height: 8),
+              const LinearProgressIndicator(),
+              const SizedBox(height: 6),
+              Text(
+                _initializing ? 'Initializing...' : 'Syncing in background...',
+                style: Theme.of(context).textTheme.bodySmall,
               ),
             ],
           ],
@@ -1181,15 +1277,23 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             if (_library.isEmpty)
               const Text('Library is empty or server returned no tracks.')
             else
-              ..._library.map(
-                (track) => ListTile(
-                  leading: const Icon(Icons.music_note),
-                  title: Text(track.title),
-                  subtitle: Text(track.id),
-                  trailing: IconButton(
-                    onPressed: () => _playTrack(track),
-                    icon: const Icon(Icons.play_circle_fill),
-                  ),
+              // Lazy list keeps build cost stable even for large libraries.
+              SizedBox(
+                height: 420,
+                child: ListView.builder(
+                  itemCount: _library.length,
+                  itemBuilder: (context, index) {
+                    final track = _library[index];
+                    return ListTile(
+                      leading: const Icon(Icons.music_note),
+                      title: Text(track.title),
+                      subtitle: Text(track.id),
+                      trailing: IconButton(
+                        onPressed: () => _playTrack(track),
+                        icon: const Icon(Icons.play_circle_fill),
+                      ),
+                    );
+                  },
                 ),
               ),
           ],

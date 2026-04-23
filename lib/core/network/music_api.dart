@@ -30,6 +30,7 @@ class MusicApi {
     return IOWebSocketChannel.connect(
       wsUri,
       headers: <String, dynamic>{
+        // WS auth mirrors REST auth header used by the backend.
         'X-Api-Token': token,
       },
     );
@@ -141,6 +142,7 @@ class MusicApi {
   }
 
   Future<List<TrackItem>> library({bool forceRescan = false}) async {
+    // Keep compatibility with both old and new backend endpoints.
     final body = await _getJson(forceRescan ? '/api/library/files' : '/api/files');
     final items = _extractList(body);
     final tracks = <TrackItem>[];
@@ -241,6 +243,7 @@ class MusicApi {
       return body;
     }
     if (body is Map<String, dynamic>) {
+      // Backends evolved over time; accept common list field names.
       for (final key in const ['tracks', 'items', 'library', 'data', 'files']) {
         final candidate = body[key];
         if (candidate is List) {
