@@ -1,12 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:multicast_dns/multicast_dns.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() {
   runApp(const MusicRemoteApp());
@@ -16,21 +20,18 @@ class MusicRemoteApp extends StatelessWidget {
   const MusicRemoteApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
+  Widget build(BuildContext context) => MaterialApp(
       title: 'Sibilarity Music Remote',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF0B57D0),
-          brightness: Brightness.light,
         ),
         visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
       home: const RemoteHomePage(),
     );
-  }
 }
 
 class RemoteHomePage extends StatefulWidget {
@@ -41,10 +42,7 @@ class RemoteHomePage extends StatefulWidget {
 }
 
 class _RemoteHomePageState extends State<RemoteHomePage> {
-  static const _defaultBaseUrl = 'http://192.168.1.79:8000';
-  static const _legacyBaseUrl = 'http://192.168.1.2:8000';
-
-  final _baseUrlController = TextEditingController(text: _defaultBaseUrl);
+  final _baseUrlController = TextEditingController();
   final _tokenController = TextEditingController();
   final _api = MusicApi();
 
@@ -61,13 +59,24 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   String _commandStatus = '';
   String _statusText = 'Disconnected';
   String _currentTrack = 'No active track';
+  String? _currentTrackId;
   String? _selectedTrackId;
   String _lastError = '';
+  bool _discovering = false;
+  bool _pairing = false;
+  String _deviceId = '';
+  String _refreshToken = '';
+  final List<DiscoveredServer> _discoveredServers = [];
+  bool _uploading = false;
+  double _uploadProgress = 0;
+  bool _metadataLoading = false;
+  TrackMetadata? _currentMetadata;
+  final Map<String, TrackMetadata> _metadataCache = {};
 
   List<TrackItem> _library = const [];
 
   WebSocketChannel? _channel;
-  StreamSubscription? _wsSubscription;
+  StreamSubscription<dynamic>? _wsSubscription;
   Timer? _positionTimer;
 
   @override
@@ -90,19 +99,38 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     final prefs = await SharedPreferences.getInstance();
     final base = prefs.getString('base_url');
     final token = prefs.getString('api_token');
+    final refresh = prefs.getString('refresh_token');
+    final deviceId = prefs.getString('device_id');
     if (base != null && base.isNotEmpty) {
-      _baseUrlController.text = base == _legacyBaseUrl ? _defaultBaseUrl : base;
+      _baseUrlController.text = base;
     }
     if (token != null) {
       _tokenController.text = token;
     }
-    await _connectAndSync();
+    if (refresh != null) {
+      _refreshToken = refresh;
+    }
+    if (deviceId != null && deviceId.isNotEmpty) {
+      _deviceId = deviceId;
+    } else {
+      final randomPart = Random().nextInt(0xFFFFFF).toRadixString(16).padLeft(6, '0');
+      _deviceId = 'mobile-${DateTime.now().millisecondsSinceEpoch}-$randomPart';
+      await prefs.setString('device_id', _deviceId);
+    }
+    if (mounted) {
+      setState(() {
+        _serverHealthy = false;
+        _statusText = 'Ready for pairing';
+      });
+    }
   }
 
   Future<void> _saveConfig() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('base_url', _baseUrlController.text.trim());
     await prefs.setString('api_token', _normalizedToken(_tokenController.text));
+    await prefs.setString('refresh_token', _refreshToken);
+    await prefs.setString('device_id', _deviceId);
   }
 
   Future<void> _connectAndSync() async {
@@ -117,8 +145,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       setState(() {
         _busy = false;
         _serverHealthy = false;
-        _statusText = 'Base URL is required';
-        _lastError = 'Please enter backend URL.';
+        _statusText = 'Server is not selected';
+        _lastError = 'Use Discover and pick a server first.';
       });
       return;
     }
@@ -126,8 +154,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       setState(() {
         _busy = false;
         _serverHealthy = false;
-        _statusText = 'API token is required';
-        _lastError = 'Please enter API token from your server config.';
+        _statusText = 'Device is not paired';
+        _lastError = 'Tap "Pair & Connect" to authorize this device.';
       });
       return;
     }
@@ -151,8 +179,18 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _connectWebSocket();
       _startPositionPolling();
       await _refreshPosition();
+      await _refreshCurrentMetadata();
       await _saveConfig();
     } catch (e) {
+      if (_refreshToken.isNotEmpty && e.toString().contains('401')) {
+        try {
+          final newToken = await _api.refreshAccessToken(_refreshToken);
+          _tokenController.text = newToken;
+          await _saveConfig();
+          await _connectAndSync();
+          return;
+        } catch (_) {}
+      }
       setState(() {
         _serverHealthy = false;
         _lastError = e.toString();
@@ -178,7 +216,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             _handleWsEvent(decoded);
           }
         },
-        onError: (error) {
+        onError: (Object error) {
           setState(() {
             _lastError = 'WebSocket unavailable. REST controls still work. Details: $error';
           });
@@ -196,6 +234,212 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _positionTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       _refreshPosition(silent: true);
     });
+  }
+
+  Future<void> _discoverServers() async {
+    if (_discovering) {
+      return;
+    }
+    setState(() {
+      _discovering = true;
+      _lastError = '';
+      _discoveredServers.clear();
+    });
+
+    final mdns = MDnsClient();
+    final discovered = <DiscoveredServer>{};
+    try {
+      await mdns.start();
+      final ptrRecords = await mdns
+          .lookup<PtrResourceRecord>(
+            ResourceRecordQuery.serverPointer('_sibilarity._tcp.local'),
+          )
+          .take(20)
+          .timeout(
+            const Duration(seconds: 4),
+            onTimeout: (sink) => sink.close(),
+          )
+          .toList();
+
+      for (final ptr in ptrRecords) {
+        final srvRecords = await mdns
+            .lookup<SrvResourceRecord>(
+              ResourceRecordQuery.service(ptr.domainName),
+            )
+            .take(2)
+            .timeout(
+              const Duration(seconds: 2),
+              onTimeout: (sink) => sink.close(),
+            )
+            .toList();
+        for (final srv in srvRecords) {
+          final hostRecords = await mdns
+              .lookup<IPAddressResourceRecord>(
+                ResourceRecordQuery.addressIPv4(srv.target),
+              )
+              .take(2)
+              .timeout(
+                const Duration(seconds: 2),
+                onTimeout: (sink) => sink.close(),
+              )
+              .toList();
+          final host = hostRecords.isNotEmpty ? hostRecords.first.address.address : srv.target.replaceFirst(RegExp(r'\.$'), '');
+          if (host.isEmpty) {
+            continue;
+          }
+          final deviceName = ptr.domainName.split('._sibilarity').first;
+          discovered.add(
+            DiscoveredServer(
+              name: deviceName.isEmpty ? host : deviceName,
+              host: host,
+              port: srv.port,
+            ),
+          );
+        }
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _discoveredServers
+          ..clear()
+          ..addAll(discovered.toList()..sort((a, b) => a.name.compareTo(b.name)));
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _lastError = 'Discovery failed: $e';
+        });
+      }
+    } finally {
+      mdns.stop();
+      if (mounted) {
+        setState(() {
+          _discovering = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _pairAndConnect() async {
+    if (_pairing) {
+      return;
+    }
+    final baseUrl = _baseUrlController.text.trim();
+    if (baseUrl.isEmpty) {
+      setState(() {
+        _lastError = 'Pick a discovered server first.';
+      });
+      return;
+    }
+    setState(() {
+      _pairing = true;
+      _lastError = '';
+    });
+    try {
+      _api.configure(baseUrl: baseUrl, token: _tokenController.text.trim());
+      final start = await _api.pairingStart(
+        deviceId: _deviceId,
+        deviceName: 'Flutter Phone',
+      );
+      final code = await _promptPairingCode(start.pairingId);
+      if (code == null) {
+        return;
+      }
+      final confirm = await _api.pairingConfirm(pairingId: start.pairingId, code: code);
+      _tokenController.text = confirm.accessToken;
+      _refreshToken = confirm.refreshToken;
+      await _saveConfig();
+      await _connectAndSync();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _lastError = 'Pairing failed: $e';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _pairing = false;
+        });
+      }
+    }
+  }
+
+  Future<String?> _promptPairingCode(String pairingId) async {
+    if (!mounted) {
+      return null;
+    }
+    var codeValue = '';
+    final shortPairingId = pairingId.length > 20
+        ? '${pairingId.substring(0, 8)}...${pairingId.substring(pairingId.length - 8)}'
+        : pairingId;
+    final value = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (sheetContext) => Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 16,
+            bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Enter Pairing Code',
+                  style: Theme.of(sheetContext).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Pairing ID: $shortPairingId',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 8),
+                const Text('Enter 6-digit code shown in server logs.'),
+                const SizedBox(height: 12),
+                TextField(
+                  autofocus: true,
+                  keyboardType: TextInputType.number,
+                  textInputAction: TextInputAction.done,
+                  maxLength: 6,
+                  onChanged: (value) {
+                    codeValue = value.trim();
+                  },
+                  decoration: const InputDecoration(
+                    labelText: 'Code',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    TextButton(
+                      onPressed: () => Navigator.of(sheetContext).pop(),
+                      child: const Text('Cancel'),
+                    ),
+                    const Spacer(),
+                    FilledButton(
+                      onPressed: () => Navigator.of(sheetContext).pop(codeValue),
+                      child: const Text('Confirm'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+    );
+    if (value == null || value.length != 6) {
+      return null;
+    }
+    return value;
   }
 
   dynamic _tryDecode(dynamic message) {
@@ -257,6 +501,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _repeatMode = _normalizeRepeatMode(repeatRaw?.toString() ?? _repeatMode);
       _statusText = statusRaw?.toString() ?? _statusText;
       _currentTrack = currentTrackId != null && currentTrackId.isNotEmpty ? _resolveTrackTitle(currentTrackId) : trackTitle;
+      _currentTrackId = currentTrackId;
       if (currentTrackId != null && currentTrackId.isNotEmpty) {
         _selectedTrackId = currentTrackId;
       }
@@ -269,6 +514,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         }
       }
     });
+    _refreshCurrentMetadata();
   }
 
   Future<void> _refreshState() async {
@@ -318,9 +564,59 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           _selectedTrackId = library.first.id;
         }
       });
+      unawaited(_refreshCurrentMetadata());
     } catch (e) {
       setState(() {
         _lastError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _refreshCurrentMetadata() async {
+    final trackId = _currentTrackId ?? _selectedTrackId;
+    if (trackId == null || trackId.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _currentMetadata = null;
+          _metadataLoading = false;
+        });
+      }
+      return;
+    }
+    final cached = _metadataCache[trackId];
+    if (cached != null) {
+      if (mounted) {
+        setState(() {
+          _currentMetadata = cached;
+          _metadataLoading = false;
+        });
+      }
+      return;
+    }
+    if (mounted) {
+      setState(() {
+        _metadataLoading = true;
+      });
+    }
+    try {
+      final raw = await _api.metadata(trackId);
+      final parsed = TrackMetadata.fromJson(raw);
+      _metadataCache[trackId] = parsed;
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        if (_currentTrackId == trackId || _selectedTrackId == trackId) {
+          _currentMetadata = parsed;
+        }
+        _metadataLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _metadataLoading = false;
       });
     }
   }
@@ -401,6 +697,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     setState(() {
       _selectedTrackId = track.id;
     });
+    unawaited(_refreshCurrentMetadata());
   }
 
   Future<void> _playSelectedTrack() async {
@@ -416,18 +713,33 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   }
 
   Future<void> _uploadTrack() async {
+    if (_uploading) {
+      return;
+    }
     final picked = await FilePicker.platform.pickFiles(type: FileType.audio);
     if (picked == null || picked.files.single.path == null) {
       return;
     }
 
     setState(() {
-      _busy = true;
+      _uploading = true;
+      _uploadProgress = 0;
       _lastError = '';
     });
 
     try {
-      await _api.uploadFile(picked.files.single.path!);
+      await _api.uploadFile(
+        picked.files.single.path!,
+        onProgress: (sentBytes, totalBytes) {
+          if (!mounted) {
+            return;
+          }
+          final progress = totalBytes <= 0 ? 0.0 : (sentBytes / totalBytes).clamp(0.0, 1.0);
+          setState(() {
+            _uploadProgress = progress;
+          });
+        },
+      );
       await _refreshLibrary();
     } catch (e) {
       setState(() {
@@ -435,7 +747,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       });
     } finally {
       setState(() {
-        _busy = false;
+        _uploading = false;
       });
     }
   }
@@ -480,9 +792,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     return '${duration.inMinutes}:${two(duration.inSeconds.remainder(60))}';
   }
 
+  String _metadataValue(Object? value, {String fallback = '-'}) {
+    if (value == null) {
+      return fallback;
+    }
+    final text = value.toString().trim();
+    return text.isEmpty ? fallback : text;
+  }
+
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
+  Widget build(BuildContext context) => Scaffold(
       appBar: AppBar(
         title: const Text('Sibilarity Music Remote'),
         actions: [
@@ -497,7 +816,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         selectedIndex: _tabIndex,
         onDestinationSelected: (index) => setState(() => _tabIndex = index),
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.equalizer), label: 'Player'),
+          NavigationDestination(icon: Icon(Icons.album), label: 'Track'),
+          NavigationDestination(icon: Icon(Icons.equalizer), label: 'Controls'),
           NavigationDestination(icon: Icon(Icons.library_music), label: 'Library'),
         ],
       ),
@@ -511,6 +831,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   _connectionCard(context),
                   const SizedBox(height: 12),
                   if (_tabIndex == 0) ...[
+                    _trackMetadataCard(context),
+                  ] else if (_tabIndex == 1) ...[
                     _nowPlayingCard(context),
                     const SizedBox(height: 12),
                     _transportCard(context),
@@ -523,7 +845,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               ),
             ),
     );
-  }
 
   Widget _connectionCard(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
@@ -547,21 +868,25 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               ],
             ),
             const SizedBox(height: 12),
-            TextField(
-              controller: _baseUrlController,
-              decoration: const InputDecoration(
-                labelText: 'Base URL',
-                hintText: _defaultBaseUrl,
-                border: OutlineInputBorder(),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.dns),
+              title: const Text('Selected server'),
+              subtitle: Text(
+                _baseUrlController.text.trim().isEmpty
+                    ? 'Not selected yet'
+                    : _baseUrlController.text.trim(),
               ),
             ),
             const SizedBox(height: 12),
-            TextField(
-              controller: _tokenController,
-              obscureText: true,
-              decoration: const InputDecoration(
-                labelText: 'API token',
-                border: OutlineInputBorder(),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.phonelink_lock),
+              title: const Text('Pairing status'),
+              subtitle: Text(
+                _normalizedToken(_tokenController.text).isEmpty
+                    ? 'Not paired'
+                    : 'Paired',
               ),
             ),
             const SizedBox(height: 12),
@@ -573,6 +898,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   onPressed: _connectAndSync,
                   icon: const Icon(Icons.link),
                   label: const Text('Connect'),
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: _pairing ? null : _pairAndConnect,
+                  icon: const Icon(Icons.phonelink_lock),
+                  label: Text(_pairing ? 'Pairing...' : 'Pair & Connect'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _discovering ? null : _discoverServers,
+                  icon: const Icon(Icons.travel_explore),
+                  label: Text(_discovering ? 'Discovering...' : 'Discover'),
                 ),
                 OutlinedButton.icon(
                   onPressed: _refreshState,
@@ -586,6 +921,28 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                 ),
               ],
             ),
+            if (_discoveredServers.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text('Discovered servers', style: Theme.of(context).textTheme.titleSmall),
+              const SizedBox(height: 8),
+              ..._discoveredServers.map(
+                (server) => ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.speaker_group),
+                  title: Text(server.name),
+                  subtitle: Text(server.baseUrl),
+                  trailing: OutlinedButton(
+                    onPressed: () {
+                      setState(() {
+                        _baseUrlController.text = server.baseUrl;
+                      });
+                    },
+                    child: const Text('Select'),
+                  ),
+                ),
+              ),
+            ],
             if (_lastError.isNotEmpty) ...[
               const SizedBox(height: 12),
               Text(
@@ -599,8 +956,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     );
   }
 
-  Widget _nowPlayingCard(BuildContext context) {
-    return Card(
+  Widget _nowPlayingCard(BuildContext context) => Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -621,7 +977,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             ),
             Slider(
               value: (_duration <= 0 ? 0 : _position.clamp(0, _duration)).toDouble(),
-              min: 0,
               max: _duration > 0 ? _duration : 1,
               onChanged: _duration > 0
                   ? (value) {
@@ -640,7 +995,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                 Expanded(
                   child: Slider(
                     value: _volume,
-                    min: 0,
                     max: 100,
                     divisions: 100,
                     label: _volume.round().toString(),
@@ -655,10 +1009,100 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         ),
       ),
     );
+
+  Widget _trackMetadataCard(BuildContext context) {
+    final metadata = _currentMetadata;
+    final title = metadata?.title ?? _currentTrack;
+    final subtitle = metadata?.artist ?? 'Unknown artist';
+
+    ImageProvider<Object>? coverProvider;
+    if (metadata?.coverBytes != null) {
+      coverProvider = MemoryImage(metadata!.coverBytes!);
+    } else if ((metadata?.coverUrl ?? '').isNotEmpty) {
+      coverProvider = NetworkImage(metadata!.coverUrl!);
+    }
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Container(
+                    width: 110,
+                    height: 110,
+                    color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                    child: coverProvider == null
+                        ? const Icon(Icons.album, size: 48)
+                        : Image(
+                            image: coverProvider,
+                            fit: BoxFit.cover,
+                          ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: Theme.of(context).textTheme.titleMedium,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        subtitle,
+                        style: Theme.of(context).textTheme.bodyLarge,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 6),
+                      Text('Status: $_statusText'),
+                      Text('${_formatDuration(_position)} / ${_formatDuration(_duration)}'),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            if (_metadataLoading) ...[
+              const SizedBox(height: 10),
+              const LinearProgressIndicator(),
+            ],
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 10,
+              runSpacing: 8,
+              children: [
+                _metaChip('Album', _metadataValue(metadata?.album)),
+                _metaChip('Year', _metadataValue(metadata?.year)),
+                _metaChip('Genre', _metadataValue(metadata?.genre)),
+                _metaChip('Track #', _metadataValue(metadata?.trackNumber)),
+                _metaChip('Bitrate', metadata?.bitrate != null ? '${metadata!.bitrate} kbps' : '-'),
+                _metaChip('Sample rate', metadata?.sampleRate != null ? '${metadata!.sampleRate} Hz' : '-'),
+                _metaChip('Channels', _metadataValue(metadata?.channels)),
+                _metaChip('Source', _metadataValue(metadata?.source)),
+                _metaChip('Found', metadata?.found ?? false ? 'yes' : 'no'),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
-  Widget _transportCard(BuildContext context) {
-    return Card(
+  Widget _metaChip(String label, String value) => Chip(
+      label: Text('$label: $value'),
+      visualDensity: VisualDensity.compact,
+    );
+
+  Widget _transportCard(BuildContext context) => Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -743,10 +1187,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         ),
       ),
     );
-  }
 
-  Widget _modesCard(BuildContext context) {
-    return Card(
+  Widget _modesCard(BuildContext context) => Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -781,10 +1223,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         ),
       ),
     );
-  }
 
-  Widget _libraryCard(BuildContext context) {
-    return Card(
+  Widget _libraryCard(BuildContext context) => Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -796,11 +1236,17 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                 const Spacer(),
                 IconButton(
                   tooltip: 'Upload file',
-                  onPressed: _uploadTrack,
+                  onPressed: _uploading ? null : _uploadTrack,
                   icon: const Icon(Icons.upload_file),
                 ),
               ],
             ),
+            if (_uploading) ...[
+              const SizedBox(height: 8),
+              LinearProgressIndicator(value: _uploadProgress),
+              const SizedBox(height: 6),
+              Text('Uploading... ${(_uploadProgress * 100).toStringAsFixed(0)}%'),
+            ],
             const SizedBox(height: 8),
             if (_library.isEmpty)
               const Text('Library is empty or server returned no tracks.')
@@ -820,7 +1266,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         ),
       ),
     );
-  }
 }
 
 class TrackItem {
@@ -828,6 +1273,114 @@ class TrackItem {
 
   final String id;
   final String title;
+}
+
+class DiscoveredServer {
+  const DiscoveredServer({
+    required this.name,
+    required this.host,
+    required this.port,
+  });
+
+  final String name;
+  final String host;
+  final int port;
+
+  String get baseUrl => 'http://$host:$port';
+
+  @override
+  bool operator ==(Object other) => other is DiscoveredServer && other.host == host && other.port == port;
+
+  @override
+  int get hashCode => Object.hash(host, port);
+}
+
+class PairingStartResult {
+  const PairingStartResult({required this.pairingId});
+
+  final String pairingId;
+}
+
+class PairingConfirmResult {
+  const PairingConfirmResult({
+    required this.accessToken,
+    required this.refreshToken,
+  });
+
+  final String accessToken;
+  final String refreshToken;
+}
+
+class TrackMetadata {
+  const TrackMetadata({
+    required this.trackId,
+    required this.source,
+    required this.found,
+    this.title,
+    this.artist,
+    this.album,
+    this.year,
+    this.genre,
+    this.trackNumber,
+    this.duration,
+    this.bitrate,
+    this.sampleRate,
+    this.channels,
+    this.coverDataUrl,
+    this.coverUrl,
+    this.coverBytes,
+  });
+
+  factory TrackMetadata.fromJson(Map<String, dynamic> json) {
+    Uint8List? decodedCoverBytes;
+    final rawCoverData = json['cover_data_url']?.toString();
+    if (rawCoverData != null && rawCoverData.isNotEmpty) {
+      final comma = rawCoverData.indexOf(',');
+      if (comma >= 0 && comma + 1 < rawCoverData.length) {
+        try {
+          decodedCoverBytes = base64Decode(rawCoverData.substring(comma + 1));
+        } catch (_) {
+          decodedCoverBytes = null;
+        }
+      }
+    }
+
+    return TrackMetadata(
+      trackId: json['track_id']?.toString() ?? '',
+      source: json['source']?.toString() ?? 'unknown',
+      found: json['found'] == true,
+      title: json['title']?.toString(),
+      artist: json['artist']?.toString(),
+      album: json['album']?.toString(),
+      year: json['year'] is num ? (json['year'] as num).toInt() : null,
+      genre: json['genre']?.toString(),
+      trackNumber: json['track_number'] is num ? (json['track_number'] as num).toInt() : null,
+      duration: json['duration'] is num ? (json['duration'] as num).toDouble() : null,
+      bitrate: json['bitrate'] is num ? (json['bitrate'] as num).toInt() : null,
+      sampleRate: json['sample_rate'] is num ? (json['sample_rate'] as num).toInt() : null,
+      channels: json['channels'] is num ? (json['channels'] as num).toInt() : null,
+      coverDataUrl: json['cover_data_url']?.toString(),
+      coverUrl: json['cover_url']?.toString(),
+      coverBytes: decodedCoverBytes,
+    );
+  }
+
+  final String trackId;
+  final String source;
+  final bool found;
+  final String? title;
+  final String? artist;
+  final String? album;
+  final int? year;
+  final String? genre;
+  final int? trackNumber;
+  final double? duration;
+  final int? bitrate;
+  final int? sampleRate;
+  final int? channels;
+  final String? coverDataUrl;
+  final String? coverUrl;
+  final Uint8List? coverBytes;
 }
 
 class MusicApi {
@@ -843,7 +1396,7 @@ class MusicApi {
     final base = Uri.parse(_baseUrl.trim());
     final token = _token.trim().replaceFirst(RegExp(r'#+$'), '');
     final wsScheme = base.scheme == 'https' ? 'wss' : 'ws';
-    final wsPath = '/ws';
+    const wsPath = '/ws';
     final wsUri = Uri(
       scheme: wsScheme,
       host: base.host,
@@ -882,6 +1435,87 @@ class MusicApi {
     return <String, dynamic>{};
   }
 
+  Future<Map<String, dynamic>> metadata(String trackId) async {
+    final encodedId = Uri.encodeComponent(trackId);
+    final body = await _getJson('/api/metadata/$encodedId');
+    if (body is Map<String, dynamic>) {
+      return body;
+    }
+    return <String, dynamic>{};
+  }
+
+  Future<PairingStartResult> pairingStart({
+    required String deviceId,
+    required String deviceName,
+  }) async {
+    final response = await http.post(
+      _buildUri('/api/pairing/start'),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'device_id': deviceId,
+        'device_name': deviceName,
+      }),
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Pairing start failed: ${response.statusCode} ${response.body}');
+    }
+    final body = jsonDecode(response.body) as Map<String, dynamic>;
+    final pairingId = body['pairing_id']?.toString() ?? '';
+    if (pairingId.isEmpty) {
+      throw Exception('Pairing start failed: missing pairing_id');
+    }
+    return PairingStartResult(pairingId: pairingId);
+  }
+
+  Future<PairingConfirmResult> pairingConfirm({
+    required String pairingId,
+    required String code,
+  }) async {
+    final response = await http.post(
+      _buildUri('/api/pairing/confirm'),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'pairing_id': pairingId,
+        'code': code,
+      }),
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Pairing confirm failed: ${response.statusCode} ${response.body}');
+    }
+    final body = jsonDecode(response.body) as Map<String, dynamic>;
+    final accessToken = body['access_token']?.toString() ?? '';
+    final refreshToken = body['refresh_token']?.toString() ?? '';
+    if (accessToken.isEmpty || refreshToken.isEmpty) {
+      throw Exception('Pairing confirm failed: missing tokens');
+    }
+    return PairingConfirmResult(accessToken: accessToken, refreshToken: refreshToken);
+  }
+
+  Future<String> refreshAccessToken(String refreshToken) async {
+    final response = await http.post(
+      _buildUri('/api/auth/refresh'),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'refresh_token': refreshToken,
+      }),
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Token refresh failed: ${response.statusCode} ${response.body}');
+    }
+    final body = jsonDecode(response.body) as Map<String, dynamic>;
+    final accessToken = body['access_token']?.toString() ?? '';
+    if (accessToken.isEmpty) {
+      throw Exception('Token refresh failed: missing access_token');
+    }
+    return accessToken;
+  }
+
   Future<List<TrackItem>> library({bool forceRescan = false}) async {
     final body = await _getJson(forceRescan ? '/api/library/files' : '/api/files');
     final items = _extractList(body);
@@ -902,13 +1536,29 @@ class MusicApi {
     return tracks;
   }
 
-  Future<void> uploadFile(String path) async {
+  Future<void> uploadFile(String path, {void Function(int sentBytes, int totalBytes)? onProgress}) async {
+    final file = File(path);
+    final totalBytes = await file.length();
+    var sentBytes = 0;
+    final fileName = path.split(RegExp(r'[\\/]')).last;
+
     final request = http.MultipartRequest('POST', _buildUri('/api/upload'));
     request.headers.addAll(_headers);
-    request.files.add(await http.MultipartFile.fromPath('file', path));
+    final stream = file.openRead().transform(
+      StreamTransformer<List<int>, List<int>>.fromHandlers(
+        handleData: (chunk, sink) {
+          sentBytes += chunk.length;
+          onProgress?.call(sentBytes, totalBytes);
+          sink.add(chunk);
+        },
+      ),
+    );
+    request.files.add(http.MultipartFile('file', stream, totalBytes, filename: fileName));
     final response = await request.send();
+    onProgress?.call(totalBytes, totalBytes);
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('Upload failed: HTTP ${response.statusCode}');
+      final body = await response.stream.bytesToString();
+      throw Exception('Upload failed: HTTP ${response.statusCode} ${body.trim()}');
     }
   }
 
