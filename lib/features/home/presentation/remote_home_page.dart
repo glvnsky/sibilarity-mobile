@@ -7,8 +7,14 @@ import 'package:flutter/material.dart';
 import 'package:music_remote_app/core/models/track_item.dart';
 import 'package:music_remote_app/core/models/track_metadata.dart';
 import 'package:music_remote_app/core/network/music_api.dart';
+import 'package:music_remote_app/features/home/presentation/widgets/library_card.dart';
+import 'package:music_remote_app/features/home/presentation/widgets/playback_queue_card.dart';
+import 'package:music_remote_app/features/home/presentation/widgets/transport_card.dart';
 import 'package:music_remote_app/features/pairing/data/pairing_discovery_service.dart';
 import 'package:music_remote_app/features/pairing/domain/models/discovered_server.dart';
+import 'package:music_remote_app/features/playback_queue/application/playback_session_service.dart';
+import 'package:music_remote_app/features/playback_queue/domain/playback_queue_service.dart';
+import 'package:music_remote_app/features/playback_queue/domain/playback_queue_snapshot.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -25,6 +31,11 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   final _baseUrlController = TextEditingController();
   final _tokenController = TextEditingController();
   final _api = MusicApi();
+  final _queueService = PlaybackQueueService();
+  late final PlaybackSessionService _playbackSession = PlaybackSessionService(
+    api: _api,
+    queueService: _queueService,
+  );
 
   int _tabIndex = 0;
   bool _busy = false;
@@ -35,6 +46,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   double _volume = 50;
   double _position = 0;
   double _duration = 0;
+  double? _stoppedSeekPosition;
   bool _isSeeking = false;
   bool _shuffle = false;
   String _repeatMode = 'off';
@@ -56,6 +68,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   final Map<String, TrackMetadata> _metadataCache = {};
 
   List<TrackItem> _library = const [];
+  PlaybackQueueSnapshot _queueSnapshot = const PlaybackQueueSnapshot(
+    items: <PlaybackQueueSnapshotItem>[],
+    currentEntryId: null,
+    currentTrackId: null,
+    pendingLibraryBackTrackId: null,
+    historyLength: 0,
+    canGoNext: false,
+    canGoPrev: false,
+    isEmpty: true,
+  );
 
   WebSocketChannel? _channel;
   StreamSubscription<dynamic>? _wsSubscription;
@@ -111,7 +133,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     if (deviceId != null && deviceId.isNotEmpty) {
       _deviceId = deviceId;
     } else {
-      final randomPart = Random().nextInt(0xFFFFFF).toRadixString(16).padLeft(6, '0');
+      final randomPart = Random()
+          .nextInt(0xFFFFFF)
+          .toRadixString(16)
+          .padLeft(6, '0');
       _deviceId = 'mobile-${DateTime.now().millisecondsSinceEpoch}-$randomPart';
       await prefs.setString('device_id', _deviceId);
     }
@@ -180,15 +205,20 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _api.library(),
       ).wait;
 
-      _applyState(state);
+      _playbackSession
+        ..setLibrary(libraryData)
+        ..hydrateQueueFromCurrentTrack(state['current_track_id']?.toString());
       setState(() {
         _serverHealthy = health;
         _library = libraryData;
-        if (libraryData.isNotEmpty && !libraryData.any((track) => track.id == _selectedTrackId)) {
+        _syncQueueState();
+        if (libraryData.isNotEmpty &&
+            !libraryData.any((track) => track.id == _selectedTrackId)) {
           _selectedTrackId = libraryData.first.id;
         }
         _statusText = health ? 'Connected' : 'No response from /health';
       });
+      _applyState(state);
 
       _connectWebSocket();
       _startPositionPolling();
@@ -238,7 +268,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       return false;
     }
     try {
-      _api.configure(baseUrl: baseUrl, token: _normalizedToken(_tokenController.text));
+      _api.configure(
+        baseUrl: baseUrl,
+        token: _normalizedToken(_tokenController.text),
+      );
       final newToken = await _api.refreshAccessToken(_refreshToken);
       _tokenController.text = newToken;
       _api.configure(baseUrl: baseUrl, token: newToken);
@@ -249,7 +282,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
   }
 
-  Future<void> _markSessionExpired({String message = 'Session expired. Pair again.'}) async {
+  Future<void> _markSessionExpired({
+    String message = 'Session expired. Pair again.',
+  }) async {
     _tokenController.clear();
     _refreshToken = '';
     final prefs = await SharedPreferences.getInstance();
@@ -319,6 +354,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _volume = 50;
       _position = 0;
       _duration = 0;
+      _stoppedSeekPosition = null;
       _isSeeking = false;
       _shuffle = false;
       _repeatMode = 'off';
@@ -328,6 +364,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _currentMetadata = null;
       _metadataCache.clear();
       _library = const [];
+      _queueService.clear();
+      _syncQueueState();
       _discoveredServers.clear();
     });
   }
@@ -348,13 +386,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         },
         onError: (Object error) {
           setState(() {
-            _lastError = 'WebSocket unavailable. REST controls still work. Details: $error';
+            _lastError =
+                'WebSocket unavailable. REST controls still work. Details: $error';
           });
         },
       );
     } catch (e) {
       setState(() {
-        _lastError = 'WebSocket unavailable. REST controls still work. Details: $e';
+        _lastError =
+            'WebSocket unavailable. REST controls still work. Details: $e';
       });
     }
   }
@@ -435,7 +475,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       if (code == null) {
         return;
       }
-      final confirm = await _api.pairingConfirm(pairingId: start.pairingId, code: code);
+      final confirm = await _api.pairingConfirm(
+        pairingId: start.pairingId,
+        code: code,
+      );
       _tokenController.text = confirm.accessToken;
       _refreshToken = confirm.refreshToken;
       await _saveConfig();
@@ -468,61 +511,61 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       isScrollControlled: true,
       useSafeArea: true,
       builder: (sheetContext) => Padding(
-          padding: EdgeInsets.only(
-            left: 16,
-            right: 16,
-            top: 16,
-            bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
-          ),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Enter Pairing Code',
-                  style: Theme.of(sheetContext).textTheme.titleLarge,
+        padding: EdgeInsets.only(
+          left: 16,
+          right: 16,
+          top: 16,
+          bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
+        ),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Enter Pairing Code',
+                style: Theme.of(sheetContext).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Pairing ID: $shortPairingId',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 8),
+              const Text('Enter 6-digit code shown in server logs.'),
+              const SizedBox(height: 12),
+              TextField(
+                autofocus: true,
+                keyboardType: TextInputType.number,
+                textInputAction: TextInputAction.done,
+                maxLength: 6,
+                onChanged: (value) {
+                  codeValue = value.trim();
+                },
+                decoration: const InputDecoration(
+                  labelText: 'Code',
+                  border: OutlineInputBorder(),
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  'Pairing ID: $shortPairingId',
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 8),
-                const Text('Enter 6-digit code shown in server logs.'),
-                const SizedBox(height: 12),
-                TextField(
-                  autofocus: true,
-                  keyboardType: TextInputType.number,
-                  textInputAction: TextInputAction.done,
-                  maxLength: 6,
-                  onChanged: (value) {
-                    codeValue = value.trim();
-                  },
-                  decoration: const InputDecoration(
-                    labelText: 'Code',
-                    border: OutlineInputBorder(),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.of(sheetContext).pop(),
+                    child: const Text('Cancel'),
                   ),
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    TextButton(
-                      onPressed: () => Navigator.of(sheetContext).pop(),
-                      child: const Text('Cancel'),
-                    ),
-                    const Spacer(),
-                    FilledButton(
-                      onPressed: () => Navigator.of(sheetContext).pop(codeValue),
-                      child: const Text('Confirm'),
-                    ),
-                  ],
-                ),
-              ],
-            ),
+                  const Spacer(),
+                  FilledButton(
+                    onPressed: () => Navigator.of(sheetContext).pop(codeValue),
+                    child: const Text('Confirm'),
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
+      ),
     );
     if (value == null || value.length != 6) {
       return null;
@@ -542,10 +585,19 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   }
 
   void _handleWsEvent(Map<String, dynamic> event) {
-    final eventType = event['type']?.toString() ?? event['event']?.toString() ?? '';
+    final eventType =
+        event['type']?.toString() ?? event['event']?.toString() ?? '';
     final payload = event['payload'];
 
-    if (eventType == 'state_changed' || eventType == 'track_changed' || eventType == 'seek_changed' || payload is Map<String, dynamic>) {
+    if (eventType == 'playback_ended') {
+      unawaited(_handlePlaybackEnded());
+      return;
+    }
+
+    if (eventType == 'state_changed' ||
+        eventType == 'track_changed' ||
+        eventType == 'seek_changed' ||
+        payload is Map<String, dynamic>) {
       if (payload is Map<String, dynamic>) {
         _applyState(payload);
       }
@@ -584,18 +636,35 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       trackTitle = trackRaw.toString();
     }
 
-    final nextVolume = (volumeRaw is num ? volumeRaw.toDouble() : _volume).clamp(0, 100).toDouble();
+    final nextVolume = (volumeRaw is num ? volumeRaw.toDouble() : _volume)
+        .clamp(0, 100)
+        .toDouble();
     final nextShuffle = shuffleRaw is bool ? shuffleRaw : _shuffle;
-    final nextRepeatMode = _normalizeRepeatMode(repeatRaw?.toString() ?? _repeatMode);
+    final nextRepeatMode = _normalizeRepeatMode(
+      repeatRaw?.toString() ?? _repeatMode,
+    );
     final nextStatus = statusRaw?.toString() ?? _statusText;
     final nextTrackId = currentTrackId;
-    final nextTrackTitle = nextTrackId != null && nextTrackId.isNotEmpty ? _resolveTrackTitle(nextTrackId) : trackTitle;
-    final nextDuration = durationRaw is num && durationRaw.toDouble() > 0 ? durationRaw.toDouble() : _duration;
-    final nextPosition = !_isSeeking && positionRaw is num ? positionRaw.toDouble() : _position;
+    final nextTrackTitle = nextTrackId != null && nextTrackId.isNotEmpty
+        ? _resolveTrackTitle(nextTrackId)
+        : trackTitle;
+    final nextDuration = durationRaw is num && durationRaw.toDouble() > 0
+        ? durationRaw.toDouble()
+        : _duration;
+    final preserveStoppedSeek =
+        !_isSeeking &&
+        _isStoppedStatus(nextStatus) &&
+        _stoppedSeekPosition != null;
+    final nextPosition = preserveStoppedSeek
+        ? _stoppedSeekPosition!
+        : (!_isSeeking && positionRaw is num
+              ? positionRaw.toDouble()
+              : _position);
     final trackChanged = _currentTrackId != nextTrackId;
 
     // Skip rebuild when deltas are tiny/no-op; this runs frequently.
-    final changed = (nextVolume - _volume).abs() > 0.1 ||
+    final changed =
+        (nextVolume - _volume).abs() > 0.1 ||
         nextShuffle != _shuffle ||
         nextRepeatMode != _repeatMode ||
         nextStatus != _statusText ||
@@ -621,6 +690,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _duration = nextDuration;
       if (!_isSeeking) {
         _position = nextPosition;
+      }
+      if (!_isStoppedStatus(nextStatus)) {
+        _stoppedSeekPosition = null;
       }
     });
 
@@ -664,7 +736,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
       if (!_isSeeking && pos is num) {
         final parsedPosition = pos.toDouble();
-        if ((parsedPosition - _position).abs() > 0.1) {
+        final shouldPreserveStoppedSeek =
+            _isStoppedStatus(_statusText) && _stoppedSeekPosition != null;
+        if (!shouldPreserveStoppedSeek &&
+            (parsedPosition - _position).abs() > 0.1) {
           nextPosition = parsedPosition;
           shouldSetState = true;
         }
@@ -706,6 +781,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       final library = await _api.library(forceRescan: true);
       setState(() {
         _library = library;
+        _playbackSession
+          ..setLibrary(library)
+          ..hydrateQueueFromCurrentTrack(_currentTrackId);
+        _syncQueueState();
         if (library.isNotEmpty && _selectedTrackId == null) {
           _selectedTrackId = library.first.id;
         }
@@ -789,7 +868,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
   }
 
-  Future<void> _sendCommand(String endpoint, {Map<String, dynamic>? body}) async {
+  Future<void> _sendCommand(
+    String endpoint, {
+    Map<String, dynamic>? body,
+  }) async {
     setState(() {
       _commandBusy = true;
       _commandStatus = 'Sending command...';
@@ -830,6 +912,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   }
 
   Future<void> _seekTo(double value) async {
+    if (_isStoppedStatus(_statusText)) {
+      setState(() {
+        _isSeeking = false;
+        _stoppedSeekPosition = value.clamp(0, _duration > 0 ? _duration : value);
+        _position = _stoppedSeekPosition!;
+        _commandStatus = 'Start position updated';
+        _lastError = '';
+      });
+      return;
+    }
     setState(() {
       _isSeeking = true;
       _position = value.clamp(0, _duration > 0 ? _duration : value);
@@ -875,27 +967,230 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     await _sendCommand('/api/modes', body: payload);
   }
 
-  Future<void> _playTrack(TrackItem track) async {
-    final payload = <String, dynamic>{
-      'track_id': track.id,
-    };
-    await _sendCommand('/api/play', body: payload);
+  Future<void> _toggleShuffle() async {
+    final nextValue = !_shuffle;
     setState(() {
-      _selectedTrackId = track.id;
+      _shuffle = nextValue;
     });
-    unawaited(_refreshCurrentMetadata());
+    await _updateModes(shuffle: nextValue);
   }
 
-  Future<void> _playSelectedTrack() async {
-    if (_library.isEmpty) {
+  Future<void> _cycleRepeatMode() async {
+    final nextMode = switch (_repeatMode) {
+      'off' => 'one',
+      'one' => 'all',
+      _ => 'off',
+    };
+    setState(() {
+      _repeatMode = nextMode;
+    });
+    await _updateModes(repeatMode: nextMode);
+  }
+
+  void _syncQueueState() {
+    _queueSnapshot = _playbackSession.snapshot();
+    final queueTrackId = _queueSnapshot.currentTrackId;
+    if (queueTrackId != null && queueTrackId.isNotEmpty) {
+      _selectedTrackId = queueTrackId;
+    }
+  }
+
+  Future<void> _runQueueAction(
+    Future<void> Function() action, {
+    required String inProgressMessage,
+  }) async {
+    setState(() {
+      _commandBusy = true;
+      _commandStatus = inProgressMessage;
+      _lastError = '';
+    });
+    try {
+      await action();
+      await _refreshState();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _syncQueueState();
+        _commandStatus = 'Done';
+      });
+      unawaited(_refreshCurrentMetadata());
+    } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _runQueueAction(action, inProgressMessage: inProgressMessage);
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _lastError = e.toString();
+        _commandStatus = 'Failed';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _commandBusy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _playTrack(TrackItem track) async {
+    await _runQueueAction(() async {
+      _stoppedSeekPosition = null;
+      await _playbackSession.playLibraryTrack(track);
+      _selectedTrackId = track.id;
+    }, inProgressMessage: 'Starting playback...');
+  }
+
+  Future<void> _playCurrentQueueTrack() async {
+    if (_library.isEmpty && _queueSnapshot.isEmpty) {
       setState(() {
         _commandStatus = 'No tracks loaded yet';
       });
       return;
     }
-    final selectedId = _selectedTrackId ?? _library.first.id;
-    final selectedTrack = _library.where((track) => track.id == selectedId).firstOrNull ?? _library.first;
-    await _playTrack(selectedTrack);
+    final startPosition = _isStoppedStatus(_statusText)
+        ? _stoppedSeekPosition
+        : null;
+    await _runQueueAction(
+      () async {
+        await _playbackSession.playQueueOrBootstrapDefault();
+        if (startPosition != null && startPosition > 0) {
+          await _api.seek(startPosition);
+        }
+      },
+      inProgressMessage: 'Starting playback...',
+    );
+  }
+
+  Future<void> _playPreviousTrack() async {
+    await _runQueueAction(
+      () => _playbackSession.playPrevious(),
+      inProgressMessage: 'Loading previous track...',
+    );
+  }
+
+  Future<void> _playNextTrack() async {
+    await _runQueueAction(
+      () => _playbackSession.playNext(),
+      inProgressMessage: 'Loading next track...',
+    );
+  }
+
+  Future<void> _handlePlaybackEnded() async {
+    await _runQueueAction(
+      () => _playbackSession.handleNaturalTrackEnd(),
+      inProgressMessage: 'Advancing queue...',
+    );
+  }
+
+  Future<void> _clearQueue() async {
+    setState(() {
+      _commandBusy = true;
+      _commandStatus = 'Clearing queue...';
+      _lastError = '';
+    });
+    try {
+      await _playbackSession.clearQueue();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _syncQueueState();
+        _commandStatus = 'Done';
+      });
+    } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _clearQueue();
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _lastError = e.toString();
+        _commandStatus = 'Failed';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _commandBusy = false;
+        });
+      }
+    }
+  }
+
+  void _addTrackToQueueStart(TrackItem track) {
+    setState(() {
+      _playbackSession.addTrackToQueueStart(track.id);
+      _selectedTrackId = track.id;
+      _syncQueueState();
+      _commandStatus = 'Added to queue start';
+    });
+  }
+
+  void _addTrackToQueueEnd(TrackItem track) {
+    setState(() {
+      _playbackSession.addTrackToQueueEnd(track.id);
+      _selectedTrackId = track.id;
+      _syncQueueState();
+      _commandStatus = 'Added to queue end';
+    });
+  }
+
+  void _addTrackAfterCurrent(TrackItem track) {
+    setState(() {
+      _playbackSession.addTrackAfterCurrent(track.id);
+      _selectedTrackId = track.id;
+      _syncQueueState();
+      _commandStatus = 'Added after current';
+    });
+  }
+
+  Future<void> _removeQueueEntry(String entryId) async {
+    await _runQueueAction(
+      () => _playbackSession.removeQueueEntry(entryId),
+      inProgressMessage: 'Removing from queue...',
+    );
+  }
+
+  void _reorderQueueEntry(int oldIndex, int newIndex) {
+    final items = _queueSnapshot.items;
+    if (items.length < 2 || oldIndex == newIndex) {
+      return;
+    }
+
+    final adjustedNewIndex = oldIndex < newIndex ? newIndex - 1 : newIndex;
+    if (adjustedNewIndex < 0 ||
+        adjustedNewIndex >= items.length ||
+        adjustedNewIndex == oldIndex) {
+      return;
+    }
+
+    final movedItem = items[oldIndex];
+    final targetItem = items[adjustedNewIndex];
+
+    setState(() {
+      if (oldIndex < newIndex) {
+        _playbackSession.moveEntryAfter(movedItem.entryId, targetItem.entryId);
+      } else {
+        _playbackSession.moveEntryBefore(movedItem.entryId, targetItem.entryId);
+      }
+      _syncQueueState();
+      _commandStatus = 'Queue reordered';
+    });
   }
 
   Future<void> _uploadTrack() async {
@@ -920,7 +1215,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
           if (!mounted) {
             return;
           }
-          final progress = totalBytes <= 0 ? 0.0 : (sentBytes / totalBytes).clamp(0.0, 1.0);
+          final progress = totalBytes <= 0
+              ? 0.0
+              : (sentBytes / totalBytes).clamp(0.0, 1.0);
           setState(() {
             _uploadProgress = progress;
           });
@@ -948,6 +1245,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
     return 'off';
   }
+
+  bool _isStoppedStatus(String value) => value.toLowerCase() == 'stopped';
 
   String _normalizedToken(String raw) {
     final trimmed = raw.trim();
@@ -992,42 +1291,80 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-      appBar: AppBar(
-        title: const Text('Sibilarity Music Remote'),
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tabIndex,
-        onDestinationSelected: (index) => setState(() => _tabIndex = index),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.album), label: 'Track'),
-          NavigationDestination(icon: Icon(Icons.equalizer), label: 'Controls'),
-          NavigationDestination(icon: Icon(Icons.library_music), label: 'Library'),
-        ],
-      ),
-      body: _busy
-          ? const Center(child: CircularProgressIndicator())
-          : RefreshIndicator(
+    appBar: AppBar(title: const Text('Sibilarity Music Remote')),
+    bottomNavigationBar: NavigationBar(
+      selectedIndex: _tabIndex,
+      onDestinationSelected: (index) => setState(() => _tabIndex = index),
+      destinations: const [
+        NavigationDestination(icon: Icon(Icons.link), label: 'Connect'),
+        NavigationDestination(icon: Icon(Icons.equalizer), label: 'Player'),
+        NavigationDestination(
+          icon: Icon(Icons.library_music),
+          label: 'Library',
+        ),
+      ],
+    ),
+    body: _busy
+        ? const Center(child: CircularProgressIndicator())
+        : RefreshIndicator(
             onRefresh: _connectFromUi,
-              child: ListView(
-                padding: const EdgeInsets.all(16),
-                children: [
+            child: ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                if (_tabIndex == 0) ...[
                   _connectionCard(context),
+                ] else if (_tabIndex == 1) ...[
+                  _trackMetadataCard(context),
                   const SizedBox(height: 12),
-                  if (_tabIndex == 0) ...[
-                    _trackMetadataCard(context),
-                  ] else if (_tabIndex == 1) ...[
-                    _nowPlayingCard(context),
-                    const SizedBox(height: 12),
-                    _transportCard(context),
-                    const SizedBox(height: 12),
-                    _modesCard(context),
-                  ] else ...[
-                    _libraryCard(context),
-                  ],
+                  _nowPlayingCard(context),
+                  const SizedBox(height: 12),
+                  TransportCard(
+                    queueSnapshot: _queueSnapshot,
+                    commandBusy: _commandBusy,
+                    currentTrackTitle: _queueSnapshot.currentTrackId == null
+                        ? 'none'
+                        : _resolveTrackTitle(_queueSnapshot.currentTrackId!),
+                    isPlaying: _statusText.toLowerCase() == 'playing',
+                    isPaused: _statusText.toLowerCase() == 'paused',
+                    canStop:
+                        _currentTrackId != null ||
+                        _statusText.toLowerCase() == 'playing' ||
+                        _statusText.toLowerCase() == 'paused',
+                    shuffleEnabled: _shuffle,
+                    repeatMode: _repeatMode,
+                    commandStatus: _commandStatus,
+                    onPrev: _playPreviousTrack,
+                    onPlay: _playCurrentQueueTrack,
+                    onPause: () => _sendCommand('/api/pause'),
+                    onResume: () => _sendCommand('/api/resume'),
+                    onStop: () => _sendCommand('/api/stop'),
+                    onNext: _playNextTrack,
+                    onCycleRepeatMode: _cycleRepeatMode,
+                    onToggleShuffle: _toggleShuffle,
+                  ),
+                  const SizedBox(height: 12),
+                  PlaybackQueueCard(
+                    queueSnapshot: _queueSnapshot,
+                    commandBusy: _commandBusy,
+                    onClearQueue: _clearQueue,
+                    onRemoveQueueEntry: _removeQueueEntry,
+                    onReorderQueueEntry: _reorderQueueEntry,
+                  ),
+                ] else ...[
+                  LibraryCard(
+                    library: _library,
+                    uploading: _uploading,
+                    uploadProgress: _uploadProgress,
+                    onRefreshLibrary: _refreshLibrary,
+                    onUploadTrack: _uploadTrack,
+                    onTrackTap: _playTrack,
+                    onTrackAction: _handleLibraryTrackAction,
+                  ),
                 ],
-              ),
+              ],
             ),
-    );
+          ),
+  );
 
   Widget _connectionCard(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
@@ -1097,16 +1434,14 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   icon: const Icon(Icons.update),
                   label: const Text('State'),
                 ),
-                OutlinedButton.icon(
-                  onPressed: _refreshLibrary,
-                  icon: const Icon(Icons.queue_music),
-                  label: const Text('Library'),
-                ),
               ],
             ),
             if (_discoveredServers.isNotEmpty) ...[
               const SizedBox(height: 12),
-              Text('Discovered servers', style: Theme.of(context).textTheme.titleSmall),
+              Text(
+                'Discovered servers',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
               const SizedBox(height: 8),
               ..._discoveredServers.map(
                 (server) => ListTile(
@@ -1128,10 +1463,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
             ],
             if (_lastError.isNotEmpty) ...[
               const SizedBox(height: 12),
-              Text(
-                _lastError,
-                style: TextStyle(color: colors.error),
-              ),
+              Text(_lastError, style: TextStyle(color: colors.error)),
             ],
             if (_initializing || _backgroundSyncing) ...[
               const SizedBox(height: 8),
@@ -1149,58 +1481,59 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   }
 
   Widget _nowPlayingCard(BuildContext context) => Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Now Playing', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 6),
-            Text(_currentTrack, style: Theme.of(context).textTheme.bodyLarge),
-            const SizedBox(height: 8),
-            Text('Status: $_statusText'),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Text(_formatDuration(_position)),
-                const Spacer(),
-                Text(_formatDuration(_duration)),
-              ],
-            ),
-            Slider(
-              value: (_duration <= 0 ? 0 : _position.clamp(0, _duration)).toDouble(),
-              max: _duration > 0 ? _duration : 1,
-              onChanged: _duration > 0
-                  ? (value) {
-                      setState(() {
-                        _isSeeking = true;
-                        _position = value;
-                      });
-                    }
-                  : null,
-              onChangeEnd: _duration > 0 ? _seekTo : null,
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                const Icon(Icons.volume_up),
-                Expanded(
-                  child: Slider(
-                    value: _volume,
-                    max: 100,
-                    divisions: 100,
-                    label: _volume.round().toString(),
-                    onChanged: (v) => setState(() => _volume = v),
-                    onChangeEnd: _setVolume,
-                  ),
+    child: Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Now Playing', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 6),
+          Text(_currentTrack, style: Theme.of(context).textTheme.bodyLarge),
+          const SizedBox(height: 8),
+          Text('Status: $_statusText'),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Text(_formatDuration(_position)),
+              const Spacer(),
+              Text(_formatDuration(_duration)),
+            ],
+          ),
+          Slider(
+            value: (_duration <= 0 ? 0 : _position.clamp(0, _duration))
+                .toDouble(),
+            max: _duration > 0 ? _duration : 1,
+            onChanged: _duration > 0
+                ? (value) {
+                    setState(() {
+                      _isSeeking = true;
+                      _position = value;
+                    });
+                  }
+                : null,
+            onChangeEnd: _duration > 0 ? _seekTo : null,
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              const Icon(Icons.volume_up),
+              Expanded(
+                child: Slider(
+                  value: _volume,
+                  max: 100,
+                  divisions: 100,
+                  label: _volume.round().toString(),
+                  onChanged: (v) => setState(() => _volume = v),
+                  onChangeEnd: _setVolume,
                 ),
-                Text('${_volume.round()}%'),
-              ],
-            ),
-          ],
-        ),
+              ),
+              Text('${_volume.round()}%'),
+            ],
+          ),
+        ],
       ),
-    );
+    ),
+  );
 
   Widget _trackMetadataCard(BuildContext context) {
     final metadata = _currentMetadata;
@@ -1228,13 +1561,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   child: Container(
                     width: 110,
                     height: 110,
-                    color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.surfaceContainerHighest,
                     child: coverProvider == null
                         ? const Icon(Icons.album, size: 48)
-                        : Image(
-                            image: coverProvider,
-                            fit: BoxFit.cover,
-                          ),
+                        : Image(image: coverProvider, fit: BoxFit.cover),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -1255,9 +1587,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      const SizedBox(height: 6),
-                      Text('Status: $_statusText'),
-                      Text('${_formatDuration(_position)} / ${_formatDuration(_duration)}'),
                     ],
                   ),
                 ),
@@ -1274,11 +1603,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               children: [
                 _metaChip('Album', _metadataValue(metadata?.album)),
                 _metaChip('Year', _metadataValue(metadata?.year)),
-                _metaChip('Genre', _metadataValue(metadata?.genre)),
-                _metaChip('Track #', _metadataValue(metadata?.trackNumber)),
-                _metaChip('Bitrate', metadata?.bitrate != null ? '${metadata!.bitrate} kbps' : '-'),
-                _metaChip('Sample rate', metadata?.sampleRate != null ? '${metadata!.sampleRate} Hz' : '-'),
-                _metaChip('Channels', _metadataValue(metadata?.channels)),
+                _metaChip(
+                  'Bitrate',
+                  metadata?.bitrate != null ? '${metadata!.bitrate} kbps' : '-',
+                ),
                 _metaChip('Source', _metadataValue(metadata?.source)),
                 _metaChip('Found', metadata?.found ?? false ? 'yes' : 'no'),
               ],
@@ -1289,181 +1617,24 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     );
   }
 
-  Widget _metaChip(String label, String value) => Chip(
-      label: Text('$label: $value'),
-      visualDensity: VisualDensity.compact,
-    );
+  Widget _metaChip(String label, String value) =>
+      Chip(label: Text('$label: $value'), visualDensity: VisualDensity.compact);
 
-  Widget _transportCard(BuildContext context) => Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Transport', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 12),
-            if (_library.isNotEmpty) ...[
-              DropdownButtonFormField<String>(
-                initialValue: _library.any((track) => track.id == _selectedTrackId) ? _selectedTrackId : _library.first.id,
-                isExpanded: true,
-                decoration: const InputDecoration(
-                  labelText: 'Track to play',
-                  border: OutlineInputBorder(),
-                ),
-                items: _library
-                    .map(
-                      (track) => DropdownMenuItem<String>(
-                        value: track.id,
-                        child: Text(
-                          track.title,
-                          maxLines: 1,
-                          softWrap: false,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (value) {
-                  if (value == null) {
-                    return;
-                  }
-                  setState(() {
-                    _selectedTrackId = value;
-                  });
-                },
-              ),
-              const SizedBox(height: 12),
-            ],
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                FilledButton.tonalIcon(
-                  onPressed: _commandBusy ? null : () => _sendCommand('/api/prev'),
-                  icon: const Icon(Icons.skip_previous),
-                  label: const Text('Prev'),
-                ),
-                FilledButton.icon(
-                  onPressed: _commandBusy ? null : _playSelectedTrack,
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text('Play'),
-                ),
-                FilledButton.icon(
-                  onPressed: _commandBusy ? null : () => _sendCommand('/api/pause'),
-                  icon: const Icon(Icons.pause),
-                  label: const Text('Pause'),
-                ),
-                FilledButton.icon(
-                  onPressed: _commandBusy ? null : () => _sendCommand('/api/resume'),
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text('Resume'),
-                ),
-                FilledButton.tonalIcon(
-                  onPressed: _commandBusy ? null : () => _sendCommand('/api/stop'),
-                  icon: const Icon(Icons.stop),
-                  label: const Text('Stop'),
-                ),
-                FilledButton.tonalIcon(
-                  onPressed: _commandBusy ? null : () => _sendCommand('/api/next'),
-                  icon: const Icon(Icons.skip_next),
-                  label: const Text('Next'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              _commandBusy ? 'Applying command...' : _commandStatus,
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-          ],
-        ),
-      ),
-    );
+  Future<void> _handleLibraryTrackAction(
+    TrackItem track,
+    LibraryTrackAction action,
+  ) async {
+    switch (action) {
+      case LibraryTrackAction.addToQueueStart:
+        _addTrackToQueueStart(track);
+        return;
+      case LibraryTrackAction.addAfterCurrent:
+        _addTrackAfterCurrent(track);
+        return;
+      case LibraryTrackAction.addToQueueEnd:
+        _addTrackToQueueEnd(track);
+        return;
+    }
+  }
 
-  Widget _modesCard(BuildContext context) => Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Modes', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 12),
-            SwitchListTile.adaptive(
-              value: _shuffle,
-              title: const Text('Shuffle'),
-              contentPadding: EdgeInsets.zero,
-              onChanged: (value) {
-                setState(() => _shuffle = value);
-                _updateModes(shuffle: value);
-              },
-            ),
-            const SizedBox(height: 8),
-            SegmentedButton<String>(
-              segments: const [
-                ButtonSegment<String>(value: 'off', label: Text('Repeat Off')),
-                ButtonSegment<String>(value: 'one', label: Text('Repeat One')),
-                ButtonSegment<String>(value: 'all', label: Text('Repeat All')),
-              ],
-              selected: {_repeatMode},
-              onSelectionChanged: (selection) {
-                final mode = selection.first;
-                setState(() => _repeatMode = mode);
-                _updateModes(repeatMode: mode);
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-
-  Widget _libraryCard(BuildContext context) => Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Text('Tracks (${_library.length})', style: Theme.of(context).textTheme.titleMedium),
-                const Spacer(),
-                IconButton(
-                  tooltip: 'Upload file',
-                  onPressed: _uploading ? null : _uploadTrack,
-                  icon: const Icon(Icons.upload_file),
-                ),
-              ],
-            ),
-            if (_uploading) ...[
-              const SizedBox(height: 8),
-              LinearProgressIndicator(value: _uploadProgress),
-              const SizedBox(height: 6),
-              Text('Uploading... ${(_uploadProgress * 100).toStringAsFixed(0)}%'),
-            ],
-            const SizedBox(height: 8),
-            if (_library.isEmpty)
-              const Text('Library is empty or server returned no tracks.')
-            else
-              // Lazy list keeps build cost stable even for large libraries.
-              SizedBox(
-                height: 420,
-                child: ListView.builder(
-                  itemCount: _library.length,
-                  itemBuilder: (context, index) {
-                    final track = _library[index];
-                    return ListTile(
-                      leading: const Icon(Icons.music_note),
-                      title: Text(track.title),
-                      subtitle: Text(track.id),
-                      trailing: IconButton(
-                        onPressed: () => _playTrack(track),
-                        icon: const Icon(Icons.play_circle_fill),
-                      ),
-                    );
-                  },
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
 }
