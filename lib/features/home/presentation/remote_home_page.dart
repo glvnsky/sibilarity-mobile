@@ -46,6 +46,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   double _volume = 50;
   double _position = 0;
   double _duration = 0;
+  double? _stoppedSeekPosition;
   bool _isSeeking = false;
   bool _shuffle = false;
   String _repeatMode = 'off';
@@ -60,7 +61,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   String _deviceId = '';
   String _refreshToken = '';
   final List<DiscoveredServer> _discoveredServers = [];
-  bool _transportLocked = false;
   bool _uploading = false;
   double _uploadProgress = 0;
   bool _metadataLoading = false;
@@ -354,6 +354,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _volume = 50;
       _position = 0;
       _duration = 0;
+      _stoppedSeekPosition = null;
       _isSeeking = false;
       _shuffle = false;
       _repeatMode = 'off';
@@ -365,7 +366,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _library = const [];
       _queueService.clear();
       _syncQueueState();
-      _transportLocked = false;
       _discoveredServers.clear();
     });
   }
@@ -651,9 +651,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     final nextDuration = durationRaw is num && durationRaw.toDouble() > 0
         ? durationRaw.toDouble()
         : _duration;
-    final nextPosition = !_isSeeking && positionRaw is num
-        ? positionRaw.toDouble()
-        : _position;
+    final preserveStoppedSeek =
+        !_isSeeking &&
+        _isStoppedStatus(nextStatus) &&
+        _stoppedSeekPosition != null;
+    final nextPosition = preserveStoppedSeek
+        ? _stoppedSeekPosition!
+        : (!_isSeeking && positionRaw is num
+              ? positionRaw.toDouble()
+              : _position);
     final trackChanged = _currentTrackId != nextTrackId;
 
     // Skip rebuild when deltas are tiny/no-op; this runs frequently.
@@ -684,6 +690,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       _duration = nextDuration;
       if (!_isSeeking) {
         _position = nextPosition;
+      }
+      if (!_isStoppedStatus(nextStatus)) {
+        _stoppedSeekPosition = null;
       }
     });
 
@@ -727,7 +736,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
       if (!_isSeeking && pos is num) {
         final parsedPosition = pos.toDouble();
-        if ((parsedPosition - _position).abs() > 0.1) {
+        final shouldPreserveStoppedSeek =
+            _isStoppedStatus(_statusText) && _stoppedSeekPosition != null;
+        if (!shouldPreserveStoppedSeek &&
+            (parsedPosition - _position).abs() > 0.1) {
           nextPosition = parsedPosition;
           shouldSetState = true;
         }
@@ -900,6 +912,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   }
 
   Future<void> _seekTo(double value) async {
+    if (_isStoppedStatus(_statusText)) {
+      setState(() {
+        _isSeeking = false;
+        _stoppedSeekPosition = value.clamp(0, _duration > 0 ? _duration : value);
+        _position = _stoppedSeekPosition!;
+        _commandStatus = 'Start position updated';
+        _lastError = '';
+      });
+      return;
+    }
     setState(() {
       _isSeeking = true;
       _position = value.clamp(0, _duration > 0 ? _duration : value);
@@ -945,11 +967,28 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     await _sendCommand('/api/modes', body: payload);
   }
 
+  Future<void> _toggleShuffle() async {
+    final nextValue = !_shuffle;
+    setState(() {
+      _shuffle = nextValue;
+    });
+    await _updateModes(shuffle: nextValue);
+  }
+
+  Future<void> _cycleRepeatMode() async {
+    final nextMode = switch (_repeatMode) {
+      'off' => 'one',
+      'one' => 'all',
+      _ => 'off',
+    };
+    setState(() {
+      _repeatMode = nextMode;
+    });
+    await _updateModes(repeatMode: nextMode);
+  }
+
   void _syncQueueState() {
     _queueSnapshot = _playbackSession.snapshot();
-    if (!_queueSnapshot.isEmpty) {
-      _transportLocked = false;
-    }
     final queueTrackId = _queueSnapshot.currentTrackId;
     if (queueTrackId != null && queueTrackId.isNotEmpty) {
       _selectedTrackId = queueTrackId;
@@ -1004,6 +1043,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   Future<void> _playTrack(TrackItem track) async {
     await _runQueueAction(() async {
+      _stoppedSeekPosition = null;
       await _playbackSession.playLibraryTrack(track);
       _selectedTrackId = track.id;
     }, inProgressMessage: 'Starting playback...');
@@ -1016,8 +1056,16 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       });
       return;
     }
+    final startPosition = _isStoppedStatus(_statusText)
+        ? _stoppedSeekPosition
+        : null;
     await _runQueueAction(
-      () => _playbackSession.playQueueOrBootstrapDefault(),
+      () async {
+        await _playbackSession.playQueueOrBootstrapDefault();
+        if (startPosition != null && startPosition > 0) {
+          await _api.seek(startPosition);
+        }
+      },
       inProgressMessage: 'Starting playback...',
     );
   }
@@ -1044,10 +1092,44 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   }
 
   Future<void> _clearQueue() async {
-    await _runQueueAction(() async {
-      await _playbackSession.clearQueueAndStop();
-      _transportLocked = true;
-    }, inProgressMessage: 'Clearing queue...');
+    setState(() {
+      _commandBusy = true;
+      _commandStatus = 'Clearing queue...';
+      _lastError = '';
+    });
+    try {
+      await _playbackSession.clearQueue();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _syncQueueState();
+        _commandStatus = 'Done';
+      });
+    } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _clearQueue();
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _lastError = e.toString();
+        _commandStatus = 'Failed';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _commandBusy = false;
+        });
+      }
+    }
   }
 
   void _addTrackToQueueStart(TrackItem track) {
@@ -1164,6 +1246,8 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     return 'off';
   }
 
+  bool _isStoppedStatus(String value) => value.toLowerCase() == 'stopped';
+
   String _normalizedToken(String raw) {
     final trimmed = raw.trim();
     return trimmed.replaceFirst(RegExp(r'#+$'), '');
@@ -1234,24 +1318,20 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   const SizedBox(height: 12),
                   _nowPlayingCard(context),
                   const SizedBox(height: 12),
-                  PlaybackQueueCard(
-                    queueSnapshot: _queueSnapshot,
-                    commandBusy: _commandBusy,
-                    onClearQueue: _clearQueue,
-                    onRemoveQueueEntry: _removeQueueEntry,
-                    onReorderQueueEntry: _reorderQueueEntry,
-                  ),
-                  const SizedBox(height: 12),
                   TransportCard(
                     queueSnapshot: _queueSnapshot,
                     commandBusy: _commandBusy,
-                    transportLocked: _transportLocked,
-                    libraryIsEmpty: _library.isEmpty,
                     currentTrackTitle: _queueSnapshot.currentTrackId == null
                         ? 'none'
                         : _resolveTrackTitle(_queueSnapshot.currentTrackId!),
-                    hasCurrentPlayback:
-                        !(_currentTrackId == null && _statusText == 'Stopped'),
+                    isPlaying: _statusText.toLowerCase() == 'playing',
+                    isPaused: _statusText.toLowerCase() == 'paused',
+                    canStop:
+                        _currentTrackId != null ||
+                        _statusText.toLowerCase() == 'playing' ||
+                        _statusText.toLowerCase() == 'paused',
+                    shuffleEnabled: _shuffle,
+                    repeatMode: _repeatMode,
                     commandStatus: _commandStatus,
                     onPrev: _playPreviousTrack,
                     onPlay: _playCurrentQueueTrack,
@@ -1259,15 +1339,25 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                     onResume: () => _sendCommand('/api/resume'),
                     onStop: () => _sendCommand('/api/stop'),
                     onNext: _playNextTrack,
+                    onCycleRepeatMode: _cycleRepeatMode,
+                    onToggleShuffle: _toggleShuffle,
                   ),
                   const SizedBox(height: 12),
-                  _modesCard(context),
+                  PlaybackQueueCard(
+                    queueSnapshot: _queueSnapshot,
+                    commandBusy: _commandBusy,
+                    onClearQueue: _clearQueue,
+                    onRemoveQueueEntry: _removeQueueEntry,
+                    onReorderQueueEntry: _reorderQueueEntry,
+                  ),
                 ] else ...[
                   LibraryCard(
                     library: _library,
                     uploading: _uploading,
                     uploadProgress: _uploadProgress,
+                    onRefreshLibrary: _refreshLibrary,
                     onUploadTrack: _uploadTrack,
+                    onTrackTap: _playTrack,
                     onTrackAction: _handleLibraryTrackAction,
                   ),
                 ],
@@ -1343,11 +1433,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   onPressed: _refreshState,
                   icon: const Icon(Icons.update),
                   label: const Text('State'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _refreshLibrary,
-                  icon: const Icon(Icons.queue_music),
-                  label: const Text('Library'),
                 ),
               ],
             ),
@@ -1502,11 +1587,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      const SizedBox(height: 6),
-                      Text('Status: $_statusText'),
-                      Text(
-                        '${_formatDuration(_position)} / ${_formatDuration(_duration)}',
-                      ),
                     ],
                   ),
                 ),
@@ -1523,19 +1603,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               children: [
                 _metaChip('Album', _metadataValue(metadata?.album)),
                 _metaChip('Year', _metadataValue(metadata?.year)),
-                _metaChip('Genre', _metadataValue(metadata?.genre)),
-                _metaChip('Track #', _metadataValue(metadata?.trackNumber)),
                 _metaChip(
                   'Bitrate',
                   metadata?.bitrate != null ? '${metadata!.bitrate} kbps' : '-',
                 ),
-                _metaChip(
-                  'Sample rate',
-                  metadata?.sampleRate != null
-                      ? '${metadata!.sampleRate} Hz'
-                      : '-',
-                ),
-                _metaChip('Channels', _metadataValue(metadata?.channels)),
                 _metaChip('Source', _metadataValue(metadata?.source)),
                 _metaChip('Found', metadata?.found ?? false ? 'yes' : 'no'),
               ],
@@ -1554,9 +1625,6 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     LibraryTrackAction action,
   ) async {
     switch (action) {
-      case LibraryTrackAction.playNow:
-        await _playTrack(track);
-        return;
       case LibraryTrackAction.addToQueueStart:
         _addTrackToQueueStart(track);
         return;
@@ -1569,39 +1637,4 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
   }
 
-  Widget _modesCard(BuildContext context) => Card(
-    child: Padding(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('Modes', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 12),
-          SwitchListTile.adaptive(
-            value: _shuffle,
-            title: const Text('Shuffle'),
-            contentPadding: EdgeInsets.zero,
-            onChanged: (value) {
-              setState(() => _shuffle = value);
-              _updateModes(shuffle: value);
-            },
-          ),
-          const SizedBox(height: 8),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment<String>(value: 'off', label: Text('Repeat Off')),
-              ButtonSegment<String>(value: 'one', label: Text('Repeat One')),
-              ButtonSegment<String>(value: 'all', label: Text('Repeat All')),
-            ],
-            selected: {_repeatMode},
-            onSelectionChanged: (selection) {
-              final mode = selection.first;
-              setState(() => _repeatMode = mode);
-              _updateModes(repeatMode: mode);
-            },
-          ),
-        ],
-      ),
-    ),
-  );
 }

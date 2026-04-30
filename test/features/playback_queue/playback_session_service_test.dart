@@ -134,15 +134,17 @@ void main() {
       },
     );
 
-    test('clearQueueAndStop clears queue and sends stop command', () async {
+    test('clearQueue keeps current track and does not send stop command', () async {
       await service.playLibraryTrack(const TrackItem(id: 'b', title: 'B'));
       api.commands.clear();
 
-      await service.clearQueueAndStop();
+      await service.clearQueue();
 
-      expect(service.snapshot().isEmpty, isTrue);
-      expect(api.commands.single.endpoint, '/api/stop');
-      expect(api.commands.single.body, isNull);
+      expect(service.snapshot().items.map((item) => item.trackId), <String>[
+        'b',
+      ]);
+      expect(service.snapshot().currentTrackId, 'b');
+      expect(api.commands, isEmpty);
     });
 
     test('hydrateQueueFromCurrentTrack bootstraps queue only once', () {

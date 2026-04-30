@@ -284,6 +284,28 @@ class PlaybackQueueService {
     _resetQueue();
   }
 
+  void clearUpcomingKeepingCurrent() {
+    final currentEntry = _currentEntry;
+    if (currentEntry == null) {
+      _resetQueue();
+      return;
+    }
+
+    final preservedEntry = QueueEntry(
+      entryId: currentEntry.entryId,
+      trackId: currentEntry.trackId,
+    );
+
+    _entriesById
+      ..clear()
+      ..[preservedEntry.entryId] = preservedEntry;
+    _historyTrackIds.clear();
+    _headEntryId = preservedEntry.entryId;
+    _tailEntryId = preservedEntry.entryId;
+    _currentEntryId = preservedEntry.entryId;
+    _pendingLibraryBackTrackId = null;
+  }
+
   String? findFirstEntryIdByTrackId(String trackId) {
     var entryId = _headEntryId;
     while (entryId != null) {

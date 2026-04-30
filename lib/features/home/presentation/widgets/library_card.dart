@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:music_remote_app/core/models/track_item.dart';
 
 enum LibraryTrackAction {
-  playNow,
   addToQueueStart,
   addAfterCurrent,
   addToQueueEnd,
@@ -15,7 +14,9 @@ class LibraryCard extends StatelessWidget {
     required this.library,
     required this.uploading,
     required this.uploadProgress,
+    required this.onRefreshLibrary,
     required this.onUploadTrack,
+    required this.onTrackTap,
     required this.onTrackAction,
     super.key,
   });
@@ -23,7 +24,9 @@ class LibraryCard extends StatelessWidget {
   final List<TrackItem> library;
   final bool uploading;
   final double uploadProgress;
+  final Future<void> Function() onRefreshLibrary;
   final Future<void> Function() onUploadTrack;
+  final Future<void> Function(TrackItem track) onTrackTap;
   final Future<void> Function(TrackItem track, LibraryTrackAction action)
   onTrackAction;
 
@@ -41,6 +44,11 @@ class LibraryCard extends StatelessWidget {
                 style: Theme.of(context).textTheme.titleMedium,
               ),
               const Spacer(),
+              IconButton(
+                tooltip: 'Refresh library',
+                onPressed: uploading ? null : () => unawaited(onRefreshLibrary()),
+                icon: const Icon(Icons.sync),
+              ),
               IconButton(
                 tooltip: 'Upload file',
                 onPressed: uploading ? null : () => unawaited(onUploadTrack()),
@@ -65,6 +73,7 @@ class LibraryCard extends StatelessWidget {
                 itemBuilder: (context, index) {
                   final track = library[index];
                   return ListTile(
+                    onTap: () => unawaited(onTrackTap(track)),
                     leading: const Icon(Icons.music_note),
                     title: Text(track.title),
                     subtitle: Text(track.id),
@@ -72,10 +81,6 @@ class LibraryCard extends StatelessWidget {
                       onSelected: (action) =>
                           unawaited(onTrackAction(track, action)),
                       itemBuilder: (context) => const [
-                        PopupMenuItem<LibraryTrackAction>(
-                          value: LibraryTrackAction.playNow,
-                          child: Text('Play now'),
-                        ),
                         PopupMenuItem<LibraryTrackAction>(
                           value: LibraryTrackAction.addToQueueStart,
                           child: Text('Add to queue start'),

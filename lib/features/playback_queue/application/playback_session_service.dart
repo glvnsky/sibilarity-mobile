@@ -57,9 +57,8 @@ class PlaybackSessionService {
     return _executePlaybackResult(result);
   }
 
-  Future<void> clearQueueAndStop() async {
-    _queueService.clear();
-    await _api.command('/api/stop');
+  Future<void> clearQueue() async {
+    _queueService.clearUpcomingKeepingCurrent();
   }
 
   void addTrackToQueueStart(String trackId) {
