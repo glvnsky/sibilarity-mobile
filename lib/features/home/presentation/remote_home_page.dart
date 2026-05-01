@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:music_remote_app/core/models/track_item.dart';
 import 'package:music_remote_app/core/models/track_metadata.dart';
 import 'package:music_remote_app/core/network/music_api.dart';
+import 'package:music_remote_app/core/platform/android_system_volume.dart';
 import 'package:music_remote_app/features/home/presentation/widgets/library_card.dart';
 import 'package:music_remote_app/features/home/presentation/widgets/playback_queue_card.dart';
 import 'package:music_remote_app/features/home/presentation/widgets/transport_card.dart';
@@ -81,7 +82,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   WebSocketChannel? _channel;
   StreamSubscription<dynamic>? _wsSubscription;
+  StreamSubscription<double>? _systemVolumeSubscription;
   Timer? _positionTimer;
+  Timer? _volumeSyncTimer;
+  double? _pendingSystemVolume;
+  double? _pendingSliderVolumeSync;
+  bool _volumeSyncInFlight = false;
+
+  static const double _systemVolumeTolerance = 5.0;
+  static const Duration _volumeSyncDebounce = Duration(milliseconds: 75);
 
   @override
   void initState() {
@@ -94,12 +103,15 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     _baseUrlController.dispose();
     _tokenController.dispose();
     _wsSubscription?.cancel();
+    _systemVolumeSubscription?.cancel();
     _channel?.sink.close();
     _positionTimer?.cancel();
+    _volumeSyncTimer?.cancel();
     super.dispose();
   }
 
   Future<void> _bootstrap() async {
+    await _initializeAndroidSystemVolumeSync();
     await _loadConfig();
     if (!mounted) {
       return;
@@ -113,6 +125,121 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         unawaited(_connectAndSync(showGlobalBusy: false));
       }
     });
+  }
+
+  Future<void> _initializeAndroidSystemVolumeSync() async {
+    if (!AndroidSystemVolume.instance.isSupported) {
+      return;
+    }
+
+    final currentVolume =
+        await AndroidSystemVolume.instance.getCurrentVolumePercent();
+    if (!mounted) {
+      return;
+    }
+    if (currentVolume != null) {
+      setState(() {
+        _volume = currentVolume;
+      });
+    }
+
+    _systemVolumeSubscription = AndroidSystemVolume.instance.volumeChanges.listen(
+      (value) => unawaited(_handleAndroidSystemVolumeChanged(value)),
+    );
+  }
+
+  Future<void> _handleAndroidSystemVolumeChanged(double value) async {
+    final nextVolume = value.clamp(0, 100).toDouble();
+    final pending = _pendingSystemVolume;
+    if (pending != null &&
+        (nextVolume - pending).abs() <= _systemVolumeTolerance) {
+      _pendingSystemVolume = null;
+      if (mounted && (nextVolume - _volume).abs() > 0.1) {
+        setState(() {
+          _volume = nextVolume;
+        });
+      }
+      return;
+    }
+
+    if (mounted && (nextVolume - _volume).abs() > 0.1) {
+      setState(() {
+        _volume = nextVolume;
+      });
+    }
+    if (!_hasServerSession()) {
+      return;
+    }
+    await _sendVolumeCommand(
+      nextVolume,
+      syncSystemVolume: false,
+      showBusy: false,
+    );
+  }
+
+  bool _hasServerSession() =>
+      _baseUrlController.text.trim().isNotEmpty &&
+      _normalizedToken(_tokenController.text).isNotEmpty &&
+      _serverHealthy;
+
+  Future<double?> _setAndroidSystemVolume(double value) async {
+    if (!AndroidSystemVolume.instance.isSupported) {
+      return null;
+    }
+    final nextVolume = value.clamp(0, 100).toDouble();
+    _pendingSystemVolume = nextVolume;
+    final applied =
+        await AndroidSystemVolume.instance.setVolumePercent(nextVolume);
+    if (applied != null) {
+      _pendingSystemVolume = applied;
+      if (mounted && (applied - _volume).abs() > 0.1) {
+        setState(() {
+          _volume = applied;
+        });
+      }
+    }
+    return applied;
+  }
+
+  void _onVolumeSliderChanged(double value) {
+    final nextVolume = value.clamp(0, 100).toDouble();
+    setState(() {
+      _volume = nextVolume;
+    });
+    _pendingSliderVolumeSync = nextVolume;
+    _volumeSyncTimer?.cancel();
+    _volumeSyncTimer = Timer(
+      _volumeSyncDebounce,
+      () => unawaited(_flushPendingVolumeSync()),
+    );
+  }
+
+  Future<void> _flushPendingVolumeSync() async {
+    _volumeSyncTimer?.cancel();
+    _volumeSyncTimer = null;
+    final queuedVolume = _pendingSliderVolumeSync;
+    if (queuedVolume == null) {
+      return;
+    }
+    if (_volumeSyncInFlight) {
+      return;
+    }
+
+    _pendingSliderVolumeSync = null;
+    _volumeSyncInFlight = true;
+    try {
+      await _sendVolumeCommand(
+        queuedVolume,
+        syncSystemVolume: true,
+        showBusy: false,
+      );
+    } finally {
+      _volumeSyncInFlight = false;
+      final nextQueued = _pendingSliderVolumeSync;
+      if (nextQueued != null && (nextQueued - queuedVolume).abs() > 0.1) {
+        unawaited(_flushPendingVolumeSync());
+      }
+    }
   }
 
   Future<void> _loadConfig() async {
@@ -204,6 +331,12 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _api.state(),
         _api.library(),
       ).wait;
+      final systemVolume =
+          await AndroidSystemVolume.instance.getCurrentVolumePercent();
+      final effectiveState = Map<String, dynamic>.from(state);
+      if (systemVolume != null) {
+        effectiveState['volume'] = systemVolume;
+      }
 
       _playbackSession
         ..setLibrary(libraryData)
@@ -218,10 +351,17 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         }
         _statusText = health ? 'Connected' : 'No response from /health';
       });
-      _applyState(state);
+      _applyState(effectiveState);
 
       _connectWebSocket();
       _startPositionPolling();
+      if (systemVolume != null) {
+        await _sendVolumeCommand(
+          systemVolume,
+          syncSystemVolume: false,
+          showBusy: false,
+        );
+      }
       await _refreshPosition();
       // Metadata can load after UI is already ready.
       unawaited(_refreshCurrentMetadata());
@@ -677,6 +817,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       return;
     }
 
+    final shouldSyncSystemVolume =
+        AndroidSystemVolume.instance.isSupported &&
+        (nextVolume - _volume).abs() > 0.1;
+
     setState(() {
       _volume = nextVolume;
       _shuffle = nextShuffle;
@@ -695,6 +839,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         _stoppedSeekPosition = null;
       }
     });
+
+    if (shouldSyncSystemVolume) {
+      unawaited(_setAndroidSystemVolume(nextVolume));
+    }
 
     if (trackChanged) {
       // Metadata fetch is tied to track identity, not every state event.
@@ -904,11 +1052,76 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
   }
 
+  Future<void> _sendVolumeCommand(
+    double value, {
+    required bool syncSystemVolume,
+    required bool showBusy,
+  }) async {
+    var nextVolume = value.clamp(0, 100).toDouble();
+    if (mounted && (nextVolume - _volume).abs() > 0.1) {
+      setState(() {
+        _volume = nextVolume;
+      });
+    }
+    if (syncSystemVolume) {
+      final applied = await _setAndroidSystemVolume(nextVolume);
+      if (applied != null) {
+        nextVolume = applied;
+      }
+    }
+
+    if (!_hasServerSession()) {
+      return;
+    }
+
+    if (showBusy && mounted) {
+      setState(() {
+        _commandBusy = true;
+        _commandStatus = 'Sending command...';
+        _lastError = '';
+      });
+    }
+    try {
+      await _api.command('/api/volume', body: {'volume': nextVolume.round()});
+      if (showBusy && mounted) {
+        setState(() {
+          _commandStatus = 'Done';
+        });
+      }
+    } catch (e) {
+      if (_isUnauthorizedError(e)) {
+        final refreshed = await _tryRefreshSession();
+        if (refreshed) {
+          await _sendVolumeCommand(
+            nextVolume,
+            syncSystemVolume: false,
+            showBusy: showBusy,
+          );
+          return;
+        }
+        await _markSessionExpired();
+        return;
+      }
+      if (mounted) {
+        setState(() {
+          _lastError = e.toString();
+          if (showBusy) {
+            _commandStatus = 'Failed';
+          }
+        });
+      }
+    } finally {
+      if (showBusy && mounted) {
+        setState(() {
+          _commandBusy = false;
+        });
+      }
+    }
+  }
+
   Future<void> _setVolume(double value) async {
-    setState(() {
-      _volume = value;
-    });
-    await _sendCommand('/api/volume', body: {'volume': value.round()});
+    _pendingSliderVolumeSync = value.clamp(0, 100).toDouble();
+    await _flushPendingVolumeSync();
   }
 
   Future<void> _seekTo(double value) async {
@@ -1523,7 +1736,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   max: 100,
                   divisions: 100,
                   label: _volume.round().toString(),
-                  onChanged: (v) => setState(() => _volume = v),
+                  onChanged: _onVolumeSliderChanged,
                   onChangeEnd: _setVolume,
                 ),
               ),
