@@ -26,30 +26,67 @@ class PlaybackSessionService {
     _queueService.rebuildFromLibraryClick(trackId);
   }
 
-  Future<QueueCommandResult> playLibraryTrack(TrackItem track) async {
+  Future<QueueCommandResult> playLibraryTrack(
+    TrackItem track, {
+    bool shuffleEnabled = false,
+  }) async {
     final result = _queueService.rebuildFromLibraryClick(track.id);
-    return _executePlaybackResult(result);
-  }
-
-  Future<QueueCommandResult> playQueueOrBootstrapDefault() async {
-    final result = _queueService.playOrBootstrapDefault();
-    return _executePlaybackResult(result);
-  }
-
-  Future<QueueCommandResult> playNext() async {
-    final result = _queueService.advanceNext();
-    return _executePlaybackResult(result);
-  }
-
-  Future<QueueCommandResult> handleNaturalTrackEnd() async {
-    final result = _queueService.advanceNext();
-    if (result.trackIdToPlay != null) {
-      await _api.command(
-        '/api/play',
-        body: <String, dynamic>{'track_id': result.trackIdToPlay},
-      );
+    if (shuffleEnabled) {
+      _queueService.shuffleUpcoming();
     }
-    return result;
+    return _executePlaybackResult(result);
+  }
+
+  Future<QueueCommandResult> playQueueOrBootstrapDefault({
+    bool shuffleEnabled = false,
+  }) async {
+    final result = _queueService.playOrBootstrapDefault();
+    if (shuffleEnabled) {
+      _queueService.shuffleUpcoming();
+    }
+    return _executePlaybackResult(result);
+  }
+
+  Future<QueueCommandResult> playNext({
+    String repeatMode = 'off',
+  }) async {
+    final currentSnapshot = snapshot();
+    if (repeatMode == 'all' &&
+        currentSnapshot.currentTrackId != null &&
+        !currentSnapshot.canGoNext) {
+      final result = _queueService.restartCycleFromHistory();
+      return _executePlaybackResult(result);
+    }
+
+    final result = _queueService.advanceNext();
+    return _executePlaybackResult(result);
+  }
+
+  Future<QueueCommandResult> handleNaturalTrackEnd({
+    String repeatMode = 'off',
+  }) async {
+    final currentSnapshot = snapshot();
+    if (repeatMode == 'one') {
+      final currentTrackId = currentSnapshot.currentTrackId;
+      if (currentTrackId != null) {
+        final result = QueueCommandResult(
+          queueChanged: false,
+          shouldStopPlayback: false,
+          trackIdToPlay: currentTrackId,
+        );
+        return _executePlaybackResult(result);
+      }
+    }
+
+    if (repeatMode == 'all' &&
+        currentSnapshot.currentTrackId != null &&
+        !currentSnapshot.canGoNext) {
+      final result = _queueService.restartCycleFromHistory();
+      return _executePlaybackResult(result);
+    }
+
+    final result = _queueService.advanceNext();
+    return _executePlaybackResult(result);
   }
 
   Future<QueueCommandResult> playPrevious() async {
@@ -60,6 +97,8 @@ class PlaybackSessionService {
   Future<void> clearQueue() async {
     _queueService.clearUpcomingKeepingCurrent();
   }
+
+  bool shuffleUpcoming() => _queueService.shuffleUpcoming();
 
   void addTrackToQueueStart(String trackId) {
     _queueService.prependTrack(trackId);

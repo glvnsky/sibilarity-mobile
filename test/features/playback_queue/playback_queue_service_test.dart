@@ -1,6 +1,26 @@
+import 'dart:math';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:music_remote_app/core/models/track_item.dart';
 import 'package:music_remote_app/features/playback_queue/domain/playback_queue_service.dart';
+
+class _FixedRandom implements Random {
+  _FixedRandom(this._values);
+
+  final List<int> _values;
+
+  @override
+  bool nextBool() => nextInt(2) == 0;
+
+  @override
+  double nextDouble() => nextInt(1000) / 1000;
+
+  @override
+  int nextInt(int max) {
+    final nextValue = _values.removeAt(0);
+    return nextValue % max;
+  }
+}
 
 void main() {
   group('PlaybackQueueService', () {
@@ -168,6 +188,22 @@ void main() {
         'e',
       ]);
       expect(snapshotAfter.currentTrackId, 'c');
+    });
+
+    test('shuffleUpcoming preserves current and shuffles future entries', () {
+      service.rebuildFromLibraryClick('b');
+
+      final changed = service.shuffleUpcoming(random: _FixedRandom(<int>[0, 0]));
+      final snapshot = service.snapshot();
+
+      expect(changed, isTrue);
+      expect(snapshot.currentTrackId, 'b');
+      expect(snapshot.items.map((item) => item.trackId), <String>[
+        'b',
+        'd',
+        'e',
+        'c',
+      ]);
     });
 
     test(

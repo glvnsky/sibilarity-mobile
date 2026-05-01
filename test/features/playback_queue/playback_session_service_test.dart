@@ -103,8 +103,83 @@ void main() {
       expect(api.commands.single.body, <String, dynamic>{'track_id': 'c'});
     });
 
+    test('playNext loops queue in repeat all mode on last track', () async {
+      await service.playLibraryTrack(const TrackItem(id: 'b', title: 'B'));
+      await service.playNext();
+      await service.playNext();
+      api.commands.clear();
+
+      final result = await service.playNext(repeatMode: 'all');
+
+      expect(result.trackIdToPlay, 'b');
+      expect(result.queueChanged, isTrue);
+      expect(service.snapshot().currentTrackId, 'b');
+      expect(service.snapshot().items.map((item) => item.trackId), <String>[
+        'b',
+        'c',
+        'd',
+      ]);
+      expect(api.commands.single.endpoint, '/api/play');
+      expect(api.commands.single.body, <String, dynamic>{'track_id': 'b'});
+    });
+
+    test('playLibraryTrack shuffles upcoming queue when shuffle is enabled', () async {
+      final result = await service.playLibraryTrack(
+        const TrackItem(id: 'b', title: 'B'),
+        shuffleEnabled: true,
+      );
+
+      expect(result.trackIdToPlay, 'b');
+      expect(service.snapshot().currentTrackId, 'b');
+      expect(service.snapshot().items.map((item) => item.trackId).toSet(), <String>{
+        'b',
+        'c',
+        'd',
+      });
+      expect(api.commands.single.endpoint, '/api/play');
+      expect(api.commands.single.body, <String, dynamic>{'track_id': 'b'});
+    });
+
+    test('handleNaturalTrackEnd repeats current track in repeat one mode', () async {
+      await service.playLibraryTrack(const TrackItem(id: 'b', title: 'B'));
+      api.commands.clear();
+
+      final result = await service.handleNaturalTrackEnd(repeatMode: 'one');
+
+      expect(result.trackIdToPlay, 'b');
+      expect(result.queueChanged, isFalse);
+      expect(service.snapshot().currentTrackId, 'b');
+      expect(service.snapshot().items.map((item) => item.trackId), <String>[
+        'b',
+        'c',
+        'd',
+      ]);
+      expect(api.commands.single.endpoint, '/api/play');
+      expect(api.commands.single.body, <String, dynamic>{'track_id': 'b'});
+    });
+
+    test('handleNaturalTrackEnd loops queue in repeat all mode on last track', () async {
+      await service.playLibraryTrack(const TrackItem(id: 'b', title: 'B'));
+      await service.playNext();
+      await service.playNext();
+      api.commands.clear();
+
+      final result = await service.handleNaturalTrackEnd(repeatMode: 'all');
+
+      expect(result.trackIdToPlay, 'b');
+      expect(result.queueChanged, isTrue);
+      expect(service.snapshot().currentTrackId, 'b');
+      expect(service.snapshot().items.map((item) => item.trackId), <String>[
+        'b',
+        'c',
+        'd',
+      ]);
+      expect(api.commands.single.endpoint, '/api/play');
+      expect(api.commands.single.body, <String, dynamic>{'track_id': 'b'});
+    });
+
     test(
-      'handleNaturalTrackEnd on last queue item does not send extra command',
+      'handleNaturalTrackEnd on last queue item sends stop command',
       () async {
         await service.playLibraryTrack(const TrackItem(id: 'd', title: 'D'));
         api.commands.clear();
@@ -114,7 +189,8 @@ void main() {
         expect(result.trackIdToPlay, isNull);
         expect(result.shouldStopPlayback, isTrue);
         expect(service.snapshot().isEmpty, isTrue);
-        expect(api.commands, isEmpty);
+        expect(api.commands.single.endpoint, '/api/stop');
+        expect(api.commands.single.body, isNull);
       },
     );
 

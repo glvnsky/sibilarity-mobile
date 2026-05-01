@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:music_remote_app/core/models/track_item.dart';
 import 'package:music_remote_app/features/playback_queue/domain/playback_queue_snapshot.dart';
 import 'package:music_remote_app/features/playback_queue/domain/queue_entry.dart';
@@ -145,6 +147,33 @@ class PlaybackQueueService {
       queueChanged: true,
       shouldStopPlayback: false,
       trackIdToPlay: _currentEntry!.trackId,
+    );
+  }
+
+  QueueCommandResult restartCycleFromHistory() {
+    final currentEntry = _currentEntry;
+    if (currentEntry == null) {
+      return const QueueCommandResult.noop();
+    }
+
+    final cycleTrackIds = <String>[
+      ..._historyTrackIds,
+      currentEntry.trackId,
+    ];
+    if (cycleTrackIds.isEmpty) {
+      return const QueueCommandResult.noop();
+    }
+
+    _resetQueue();
+    for (final trackId in cycleTrackIds) {
+      _appendEntry(trackId);
+    }
+    _currentEntryId = _headEntryId;
+
+    return QueueCommandResult(
+      queueChanged: true,
+      shouldStopPlayback: false,
+      trackIdToPlay: cycleTrackIds.first,
     );
   }
 
@@ -306,6 +335,59 @@ class PlaybackQueueService {
     _pendingLibraryBackTrackId = null;
   }
 
+  bool shuffleUpcoming({Random? random}) {
+    final anchorEntryId = _currentEntryId ?? _headEntryId;
+    if (anchorEntryId == null) {
+      return false;
+    }
+
+    final anchorEntry = _entriesById[anchorEntryId];
+    if (anchorEntry == null) {
+      return false;
+    }
+
+    final upcomingEntries = <QueueEntry>[];
+    var entryId = anchorEntry.nextEntryId;
+    while (entryId != null) {
+      final entry = _entriesById[entryId];
+      if (entry == null) {
+        break;
+      }
+      upcomingEntries.add(entry);
+      entryId = entry.nextEntryId;
+    }
+
+    if (upcomingEntries.length < 2) {
+      return false;
+    }
+
+    final nextRandom = random ?? Random();
+    for (var index = upcomingEntries.length - 1; index > 0; index -= 1) {
+      final swapIndex = nextRandom.nextInt(index + 1);
+      final current = upcomingEntries[index];
+      upcomingEntries[index] = upcomingEntries[swapIndex];
+      upcomingEntries[swapIndex] = current;
+    }
+
+    anchorEntry.nextEntryId = upcomingEntries.first.entryId;
+    for (var index = 0; index < upcomingEntries.length; index += 1) {
+      final entry = upcomingEntries[index];
+      final previousEntryId = index == 0
+          ? anchorEntry.entryId
+          : upcomingEntries[index - 1].entryId;
+      final nextEntryId = index == upcomingEntries.length - 1
+          ? null
+          : upcomingEntries[index + 1].entryId;
+      _setEntryLinks(
+        entry,
+        prevEntryId: previousEntryId,
+        nextEntryId: nextEntryId,
+      );
+    }
+    _tailEntryId = upcomingEntries.last.entryId;
+    return true;
+  }
+
   String? findFirstEntryIdByTrackId(String trackId) {
     var entryId = _headEntryId;
     while (entryId != null) {
@@ -350,6 +432,16 @@ class PlaybackQueueService {
 
   void _appendEntry(String trackId) {
     _appendExistingEntry(QueueEntry(entryId: _nextEntryId(), trackId: trackId));
+  }
+
+  void _setEntryLinks(
+    QueueEntry entry, {
+    required String? prevEntryId,
+    required String? nextEntryId,
+  }) {
+    entry
+      ..prevEntryId = prevEntryId
+      ..nextEntryId = nextEntryId;
   }
 
   void _appendExistingEntry(QueueEntry entry) {

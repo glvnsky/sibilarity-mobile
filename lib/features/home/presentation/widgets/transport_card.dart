@@ -10,15 +10,14 @@ class TransportCard extends StatelessWidget {
     required this.currentTrackTitle,
     required this.isPlaying,
     required this.isPaused,
-    required this.canStop,
     required this.shuffleEnabled,
     required this.repeatMode,
+    required this.canGoNext,
     required this.commandStatus,
     required this.onPrev,
     required this.onPlay,
     required this.onPause,
     required this.onResume,
-    required this.onStop,
     required this.onNext,
     required this.onCycleRepeatMode,
     required this.onToggleShuffle,
@@ -30,15 +29,14 @@ class TransportCard extends StatelessWidget {
   final String currentTrackTitle;
   final bool isPlaying;
   final bool isPaused;
-  final bool canStop;
   final bool shuffleEnabled;
   final String repeatMode;
+  final bool canGoNext;
   final String commandStatus;
   final Future<void> Function() onPrev;
   final Future<void> Function() onPlay;
   final Future<void> Function() onPause;
   final Future<void> Function() onResume;
-  final Future<void> Function() onStop;
   final Future<void> Function() onNext;
   final Future<void> Function() onCycleRepeatMode;
   final Future<void> Function() onToggleShuffle;
@@ -151,7 +149,7 @@ class TransportCard extends StatelessWidget {
                     dimension: _transportButtonSize,
                     child: IconButton.filledTonal(
                       tooltip: 'Next',
-                      onPressed: commandBusy || !queueSnapshot.canGoNext
+                      onPressed: commandBusy || !canGoNext
                           ? null
                           : () => unawaited(onNext()),
                       icon: const Icon(Icons.skip_next),
@@ -177,19 +175,6 @@ class TransportCard extends StatelessWidget {
                 ],
               );
             },
-          ),
-          const SizedBox(height: 12),
-          Center(
-            child: SizedBox.square(
-              dimension: _transportButtonSize,
-              child: IconButton.filledTonal(
-                tooltip: 'Stop',
-                onPressed: commandBusy || !canStop
-                    ? null
-                    : () => unawaited(onStop()),
-                icon: const Icon(Icons.stop),
-              ),
-            ),
           ),
           const SizedBox(height: 8),
           Text(

@@ -1184,6 +1184,10 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     final nextValue = !_shuffle;
     setState(() {
       _shuffle = nextValue;
+      if (nextValue && _playbackSession.shuffleUpcoming()) {
+        _syncQueueState();
+        _commandStatus = 'Queue shuffled';
+      }
     });
     await _updateModes(shuffle: nextValue);
   }
@@ -1257,7 +1261,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   Future<void> _playTrack(TrackItem track) async {
     await _runQueueAction(() async {
       _stoppedSeekPosition = null;
-      await _playbackSession.playLibraryTrack(track);
+      await _playbackSession.playLibraryTrack(track, shuffleEnabled: _shuffle);
       _selectedTrackId = track.id;
     }, inProgressMessage: 'Starting playback...');
   }
@@ -1274,7 +1278,9 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
         : null;
     await _runQueueAction(
       () async {
-        await _playbackSession.playQueueOrBootstrapDefault();
+        await _playbackSession.playQueueOrBootstrapDefault(
+          shuffleEnabled: _shuffle,
+        );
         if (startPosition != null && startPosition > 0) {
           await _api.seek(startPosition);
         }
@@ -1292,14 +1298,14 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
 
   Future<void> _playNextTrack() async {
     await _runQueueAction(
-      () => _playbackSession.playNext(),
+      () => _playbackSession.playNext(repeatMode: _repeatMode),
       inProgressMessage: 'Loading next track...',
     );
   }
 
   Future<void> _handlePlaybackEnded() async {
     await _runQueueAction(
-      () => _playbackSession.handleNaturalTrackEnd(),
+      () => _playbackSession.handleNaturalTrackEnd(repeatMode: _repeatMode),
       inProgressMessage: 'Advancing queue...',
     );
   }
@@ -1539,18 +1545,17 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                         : _resolveTrackTitle(_queueSnapshot.currentTrackId!),
                     isPlaying: _statusText.toLowerCase() == 'playing',
                     isPaused: _statusText.toLowerCase() == 'paused',
-                    canStop:
-                        _currentTrackId != null ||
-                        _statusText.toLowerCase() == 'playing' ||
-                        _statusText.toLowerCase() == 'paused',
                     shuffleEnabled: _shuffle,
                     repeatMode: _repeatMode,
+                    canGoNext:
+                        _queueSnapshot.canGoNext ||
+                        (_repeatMode == 'all' &&
+                            _queueSnapshot.currentTrackId != null),
                     commandStatus: _commandStatus,
                     onPrev: _playPreviousTrack,
                     onPlay: _playCurrentQueueTrack,
                     onPause: () => _sendCommand('/api/pause'),
                     onResume: () => _sendCommand('/api/resume'),
-                    onStop: () => _sendCommand('/api/stop'),
                     onNext: _playNextTrack,
                     onCycleRepeatMode: _cycleRepeatMode,
                     onToggleShuffle: _toggleShuffle,
